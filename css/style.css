@@ -1253,6 +1253,10 @@ a {
   height: 420px;
   border-bottom: 1px solid var(--line-soft);
 }
+#header:before,
+#header:after {
+  pointer-events: none;
+}
 #banner {
   background: -webkit-linear-gradient(270deg, #fafafa 0%, #f1f1f3 100%);
   background: -moz-linear-gradient(270deg, #fafafa 0%, #f1f1f3 100%);
@@ -1261,6 +1265,7 @@ a {
 }
 .hero-overlay {
   background: transparent;
+  pointer-events: none;
 }
 #header-outer {
   display: -webkit-box;
@@ -1282,6 +1287,8 @@ a {
 }
 #header-inner {
   margin-top: 12px;
+  position: relative;
+  z-index: 3;
 }
 #header-title {
   position: relative;
@@ -1387,6 +1394,8 @@ a {
   border: 1px solid var(--line-soft);
   border-radius: 999px;
   backdrop-filter: blur(8px);
+  position: relative;
+  z-index: 4;
 }
 #main-nav {
   margin-left: 0;
@@ -1400,6 +1409,8 @@ a {
 .nav-icon {
   color: var(--text-3);
   opacity: 1;
+  position: relative;
+  z-index: 5;
 }
 .main-nav-link {
   padding: 10px 14px;
