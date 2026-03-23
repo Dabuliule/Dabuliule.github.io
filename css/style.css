@@ -1252,6 +1252,7 @@ a {
 #header {
   height: 420px;
   border-bottom: 1px solid var(--line-soft);
+  position: relative;
 }
 #header:before,
 #header:after {
@@ -1288,7 +1289,7 @@ a {
 #header-inner {
   margin-top: 12px;
   position: relative;
-  z-index: 3;
+  z-index: 20;
 }
 #header-title {
   position: relative;
@@ -1298,6 +1299,13 @@ a {
   height: auto;
   text-align: center;
   padding-top: 96px;
+  z-index: 1;
+  pointer-events: none;
+}
+#header-title a,
+#header-title button,
+#header-title .hero-actions {
+  pointer-events: auto;
 }
 .hero-kicker {
   margin: 0 0 10px;
@@ -1395,7 +1403,18 @@ a {
   border-radius: 999px;
   backdrop-filter: blur(8px);
   position: relative;
-  z-index: 4;
+  z-index: 30;
+  display: -webkit-box;
+  display: -moz-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: box;
+  display: flex;
+  -webkit-box-align: stretch;
+  -moz-box-align: stretch;
+  -ms-flex-align: stretch;
+  -webkit-align-items: stretch;
+  align-items: stretch;
 }
 #main-nav {
   margin-left: 0;
@@ -1410,7 +1429,27 @@ a {
   color: var(--text-3);
   opacity: 1;
   position: relative;
-  z-index: 5;
+  z-index: 40;
+  display: -webkit-box;
+  display: -moz-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: box;
+  display: flex;
+  -webkit-box-align: center;
+  -moz-box-align: center;
+  -ms-flex-align: center;
+  -webkit-align-items: center;
+  align-items: center;
+  -webkit-box-pack: center;
+  -moz-box-pack: center;
+  -ms-flex-pack: center;
+  -webkit-justify-content: center;
+  justify-content: center;
+  -webkit-box-sizing: border-box;
+  -moz-box-sizing: border-box;
+  box-sizing: border-box;
+  min-height: 34px;
 }
 .main-nav-link {
   padding: 10px 14px;
