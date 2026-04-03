@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html data-palette="breeze" data-mode="auto">
 <head>
   <meta charset="utf-8">
   
@@ -36,6 +36,7 @@
 <meta name="generator" content="Hexo 8.1.1"></head>
 
 <body>
+  <div id="reading-progress" aria-hidden="true"></div>
   <div id="container">
     <div id="wrap">
       <header id="header">
@@ -77,6 +78,9 @@
             <a class="nav-icon" target="_blank" rel="noopener" href="https://github.com/Dabuliule"><span class="fa fa-github"></span></a>
           
         
+        <button id="color-mode-toggle" class="nav-icon nav-mode-btn" type="button" title="切换主题" aria-label="切换亮暗模式">
+          <span class="fa fa-adjust"></span>
+        </button>
         
           <a class="nav-icon" href="/atom.xml" title="RSS 订阅"><span class="fa fa-rss"></span></a>
         
@@ -108,6 +112,7 @@
 		<section class="home-post-feed">
 			<h3 class="home-section-title">最新发布</h3>
 			
+				
 				
 				<article class="home-post-card">
 					<div class="home-post-head">
