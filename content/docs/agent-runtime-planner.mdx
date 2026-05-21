@@ -1,0 +1,670 @@
+---
+title: "重新理解 Agent Runtime 中的 Planner"
+date: "2026-05-11"
+tag: "Agent"
+description: "Function Calling 并没有消灭 Planner，它只是把单步工具选择变成了模型能力。真正的 Agent Runtime，关心的是执行过程的控制权。"
+---
+
+很多人在第一次实现 Agent Runtime 时，都会先写一个 `Planner`。
+
+它通常长这样：
+
+```python
+plan = planner.plan(state)
+```
+
+然后 Planner 负责决定：
+
+- 当前任务应该拆成几步
+- 每一步调用什么工具
+- 工具参数是什么
+- 执行失败后是否重试
+- 什么时候输出最终答案
+
+这个设计很自然。
+
+因为在传统的 Agent 架构里，我们通常会把系统拆成：
+
+```text
+Planner -> Executor -> Tool -> Observation
+```
+
+Planner 负责“想”，Executor 负责“做”。
+
+但是 Function Calling 出现之后，这个边界突然变得模糊了。
+
+现在模型可以直接返回工具调用：
+
+```python
+client.chat.completions.create(
+    model="gpt-4.1",
+    messages=messages,
+    tools=tools,
+    tool_choice="auto",
+)
+```
+
+返回结果里可能直接带着：
+
+```json
+{
+  "tool_calls": [
+    {
+      "function": {
+        "name": "search_web",
+        "arguments": "{\"query\":\"OpenAI revenue\"}"
+      }
+    }
+  ]
+}
+```
+
+这时候很多人会产生一个疑问：
+
+> 既然模型已经能自己选择工具了，那 Planner 还有必要存在吗？
+
+我一开始也卡在这里。
+
+因为从表面看，Function Calling 已经完成了 Planner 最核心的工作：
+
+```text
+根据当前上下文，选择下一步动作。
+```
+
+但后来我慢慢意识到，问题不应该问：
+
+```text
+模型能不能调用工具？
+```
+
+而应该问：
+
+```text
+谁在控制整个执行过程？
+```
+
+这才是 Agent Runtime 的核心问题。
+
+---
+
+## Function Calling 到底解决了什么
+
+Function Calling 很容易被理解成：
+
+```text
+让模型输出结构化 JSON
+```
+
+这个理解没错，但不够准确。
+
+更准确地说，Function Calling 是一种：
+
+```text
+动作选择协议
+```
+
+它把原来不稳定的自然语言输出：
+
+```text
+我觉得应该调用 search_web，参数是 xxx
+```
+
+变成了结构化的工具调用：
+
+```json
+{
+  "name": "search_web",
+  "arguments": {
+    "query": "OpenAI revenue"
+  }
+}
+```
+
+这件事非常重要。
+
+因为它解决了传统 ReAct 里最麻烦的一类问题：
+
+- 不需要再用正则解析 `Action: xxx`
+- 不需要猜模型到底想调哪个工具
+- 不需要从一段自然语言里抠参数
+- 工具参数可以被 schema 约束
+- Runtime 可以更稳定地接管执行
+
+所以 Function Calling 并不是一个简单的输出格式优化。
+
+它本质上把：
+
+```text
+Tool Selection
+```
+
+变成了模型原生能力。
+
+也就是说，模型现在可以直接做：
+
+```text
+State -> Next Action
+```
+
+看到当前状态，决定下一步动作。
+
+从这个角度看，Function Calling 确实吃掉了一部分 Planner 的工作。
+
+但它吃掉的只是：
+
+```text
+单步 Planner
+```
+
+而不是完整意义上的 Runtime Planner。
+
+---
+
+## 单步动作选择，不等于任务级规划
+
+很多简单 Agent 的执行循环都很像：
+
+```python
+while True:
+    response = llm.chat(
+        messages=messages,
+        tools=tools,
+    )
+
+    if response.tool_calls:
+        observation = executor.run(response.tool_calls)
+        messages.append(observation)
+        continue
+
+    return response.content
+```
+
+这类架构非常有效。
+
+它的运行方式是：
+
+```text
+Think -> Act -> Observe -> Think
+```
+
+模型每次只决定下一步。
+
+如果需要工具，就调用工具；如果不需要工具，就直接回答。
+
+这种模式适合很多场景：
+
+- 问答
+- 搜索
+- 简单文件操作
+- 简单代码修改
+- 一次性数据查询
+- 小范围任务自动化
+
+在这种系统里，确实可以不显式写一个很重的 Planner。
+
+因为模型本身已经承担了：
+
+```text
+下一步做什么
+```
+
+这个职责。
+
+这种架构可以叫做：
+
+```text
+LLM-centric Runtime
+```
+
+也就是模型主导执行流。
+
+Runtime 只做很薄的一层：
+
+- 把工具 schema 传给模型
+- 接收 tool call
+- 执行工具
+- 把 observation 写回上下文
+- 继续循环
+
+对于简单任务，这已经足够了。
+
+---
+
+## 复杂任务的问题不在于“会不会调工具”
+
+真正的问题会在任务变复杂后出现。
+
+比如用户给 Agent 一个任务：
+
+```text
+帮我调研 10 家 AI Infra 公司，整理融资信息、产品定位、竞争关系，并生成一份报告。
+```
+
+这个任务不是简单的：
+
+```text
+下一步调用哪个工具？
+```
+
+它更像是一个完整 workflow：
+
+```text
+确定调研范围
+    ↓
+搜索公司列表
+    ↓
+并行抓取资料
+    ↓
+清洗和去重信息
+    ↓
+分析产品定位
+    ↓
+比较竞争关系
+    ↓
+生成结构化报告
+    ↓
+导出文件
+```
+
+这里开始出现很多 Runtime 层面的复杂性：
+
+- 哪些步骤可以并行
+- 哪些步骤必须等待前置结果
+- 某个工具失败后是否重试
+- 搜索结果质量差时是否重新规划
+- 中间结果是否要缓存
+- 任务执行到一半能否暂停
+- 程序崩溃后能否恢复
+- 如何记录每一步的 trace
+- 最终结果如何证明可靠
+
+这些问题不是 Function Calling 能直接解决的。
+
+Function Calling 只能告诉你：
+
+```text
+当前这一步应该调用什么工具。
+```
+
+但它不会天然解决：
+
+```text
+整个任务应该如何稳定运行。
+```
+
+这就是 Planner 和 Runtime 重新出现的地方。
+
+---
+
+## Runtime 真正负责的是 Execution Semantics
+
+很多人会把 Agent 简化成：
+
+```text
+Agent = LLM + Tools
+```
+
+这个定义适合 demo，但不适合工程系统。
+
+在工程里，更准确的理解应该是：
+
+```text
+Agent Runtime = LLM 驱动的执行系统
+```
+
+它真正关心的是执行语义，而不只是工具调用。
+
+所谓执行语义，就是这些问题：
+
+- 状态如何保存
+- 步骤如何推进
+- 工具如何调度
+- 失败如何处理
+- 是否允许重试
+- 是否允许回滚
+- 是否支持中断
+- 是否支持恢复
+- 是否可以 replay
+- 是否可以观测和审计
+
+这些能力决定了一个 Agent 能不能从 demo 变成系统。
+
+Function Calling 解决的是：
+
+```text
+动作表达
+```
+
+Runtime 解决的是：
+
+```text
+执行控制
+```
+
+这两个不是一个层级的问题。
+
+---
+
+## Planner 没有消失，只是分层了
+
+我后来更愿意把 Planner 分成两类。
+
+---
+
+## 1. 隐式 Planner：模型自己决定下一步
+
+隐式 Planner 就是：
+
+```text
+LLM + Function Calling
+```
+
+它没有一个单独的 `Planner` 类。
+
+模型在每一轮对话里，根据当前 `messages` 和工具列表，直接决定下一步动作。
+
+它的形式通常是：
+
+```text
+State -> Tool Call
+```
+
+优点很明显：
+
+- 实现简单
+- 交互自然
+- 适合 ReAct
+- 适合开放式任务
+- 对 prompt 依赖相对少
+- 迭代速度快
+
+但缺点也很明显：
+
+- 不容易预测执行路径
+- 长任务容易漂移
+- 很难做 DAG
+- 很难做严格依赖控制
+- 很难稳定 replay
+- 很难做强约束 workflow
+
+所以隐式 Planner 很适合：
+
+```text
+探索型任务
+```
+
+但不一定适合：
+
+```text
+强流程任务
+```
+
+---
+
+## 2. 显式 Planner：先生成任务结构，再由 Runtime 执行
+
+显式 Planner 会把任务拆成明确的结构。
+
+例如：
+
+```json
+{
+  "tasks": [
+    {
+      "id": "collect_companies",
+      "goal": "收集 AI Infra 公司列表",
+      "depends_on": []
+    },
+    {
+      "id": "collect_funding",
+      "goal": "收集每家公司的融资信息",
+      "depends_on": ["collect_companies"]
+    },
+    {
+      "id": "write_report",
+      "goal": "生成最终调研报告",
+      "depends_on": ["collect_funding"]
+    }
+  ]
+}
+```
+
+这时候 LLM 不再直接控制整个执行流。
+
+它只负责生成计划、修正计划，或者在某个节点上做局部推理。
+
+真正控制执行的是 Runtime。
+
+Runtime 可以根据这个计划做：
+
+- 拓扑排序
+- 并发调度
+- 超时控制
+- 重试策略
+- 中间结果持久化
+- checkpoint
+- resume
+- trace
+- replay
+
+这种架构更像：
+
+```text
+Workflow Engine + LLM Reasoning
+```
+
+它的优点是稳定、可控、可观测。
+
+缺点是系统复杂度更高。
+
+因为你需要定义：
+
+- Plan schema
+- Task schema
+- State schema
+- Executor 行为
+- Retry 策略
+- 失败状态
+- Replan 条件
+
+所以显式 Planner 不是所有 Agent 都需要。
+
+但只要任务开始变长、变重、变关键，它就会重新变得重要。
+
+---
+
+## Planner 的职责正在从“选工具”变成“控流程”
+
+Function Calling 出现之前，很多 Planner 负责的是：
+
+```text
+我要调用什么工具？
+```
+
+Function Calling 出现之后，这个职责被模型原生能力吸收了。
+
+所以传统意义上的 Planner 确实变薄了。
+
+但新的 Planner 会更偏向：
+
+```text
+任务结构设计
+执行策略选择
+流程控制决策
+```
+
+也就是说，Planner 不再只是 Tool Selector。
+
+它更像是 Runtime 的策略层。
+
+它关心的问题变成：
+
+```text
+这个任务应该如何被执行？
+```
+
+而不是：
+
+```text
+下一步该调哪个工具？
+```
+
+这也是为什么很多 Agent Framework 最后会越来越像工作流系统。
+
+比如：
+
+```text
+LangGraph
+Temporal
+DAG Engine
+Workflow Runtime
+```
+
+它们解决的重点不是：
+
+```text
+怎么让模型调用工具
+```
+
+而是：
+
+```text
+怎么让一个复杂任务稳定、可控、可恢复地跑完
+```
+
+---
+
+## 回到自己的 Agent Runtime
+
+如果是我现在重新设计 Agent Runtime，我不会一上来就写一个很重的 Planner。
+
+我会先实现一个单步 Agent 循环：
+
+```text
+Agent -> ToolAction -> Executor -> Observation -> Agent
+```
+
+也就是每次只让模型决定一步。
+
+这个阶段最重要的是把基础设施打牢：
+
+- `AgentState`
+- `Step`
+- `ToolAction`
+- `ToolResult`
+- `EventBus`
+- `Trace`
+- `Executor`
+- `ToolRegistry`
+- `FinalAnswerTool`
+
+先保证 Runtime 能稳定地跑起来。
+
+等到任务开始复杂之后，再把 Planner 抽出来。
+
+而且这个 Planner 不一定是一个生成完整计划的模块。
+
+它也可以是更轻量的东西：
+
+```text
+根据当前 state，决定下一阶段目标。
+```
+
+或者：
+
+```text
+把用户任务拆成几个 capability。
+```
+
+甚至：
+
+```text
+只负责判断当前执行是否偏离目标，是否需要 replan。
+```
+
+这时 Planner 就不是一个固定形态的类。
+
+它是一种职责。
+
+只要系统里存在：
+
+```text
+任务分解、执行策略、流程控制
+```
+
+它就存在 Planner。
+
+---
+
+## 一个更清晰的分层方式
+
+我现在更倾向于这样理解 Agent Runtime：
+
+```text
+LLM
+  负责推理、判断、生成结构化动作
+
+Function Calling
+  负责把动作变成可执行的工具调用协议
+
+Executor
+  负责真正执行工具，并把结果包装成 observation
+
+State
+  负责保存任务、历史、结果和运行状态
+
+Runtime
+  负责推进循环、处理中断、重试、完成和失败
+
+Planner
+  负责更高层的任务拆解、策略选择和流程控制
+```
+
+所以 Function Calling 不应该被理解成 Runtime 的替代品。
+
+它只是 Runtime 里面的一层协议。
+
+它让模型更容易调用工具，但没有替 Runtime 解决执行系统的问题。
+
+---
+
+## 结论
+
+Function Calling 并没有消灭 Planner。
+
+它只是消灭了很多手写的、脆弱的、基于文本解析的单步 Planner。
+
+以前我们需要让模型输出：
+
+```text
+Action: search_web
+Action Input: xxx
+```
+
+然后 Runtime 再用正则去解析。
+
+现在模型可以直接输出结构化 tool call。
+
+这当然更好。
+
+但真正复杂的 Agent 系统，需要的不只是工具调用。
+
+它还需要：
+
+- 状态管理
+- 执行控制
+- 失败恢复
+- 可观测性
+- 可审计性
+- 可重复执行
+- 任务级规划
+- workflow 语义
+
+所以更准确的说法是：
+
+> Function Calling 让单步工具选择标准化了，但没有取代 Agent Runtime。  
+> Planner 也没有消失，它只是从“选工具”迁移到了“控流程”。
+
+Agent Runtime 真正难的地方，从来不是让模型调用一个工具。
+
+而是让一个复杂任务在不确定的模型输出、不稳定的外部工具和不断变化的状态中，仍然能够稳定地运行下去。

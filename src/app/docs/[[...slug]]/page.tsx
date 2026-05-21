@@ -12,11 +12,20 @@ import { getMDXComponents } from '@/components/mdx';
 import type { Metadata } from 'next';
 import { createRelativeLink } from 'fumadocs-ui/mdx';
 import { gitConfig } from '@/lib/shared';
+import { redirect } from 'next/navigation';
 
 export default async function Page(props: PageProps<'/docs/[[...slug]]'>) {
   const params = await props.params;
   const page = source.getPage(params.slug);
-  if (!page) notFound();
+  if (!page) {
+    const normalizedSlug = params.slug?.map((segment) => segment.replaceAll('-', '_'));
+
+    if (normalizedSlug && source.getPage(normalizedSlug)) {
+      redirect(`/docs/${normalizedSlug.join('/')}`);
+    }
+
+    notFound();
+  }
 
   const MDX = page.data.body;
   const markdownUrl = getPageMarkdownUrl(page).url;

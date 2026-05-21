@@ -1,0 +1,954 @@
+---
+title: "从 State 到 Exactly Once：Flink RocksDB 与 Checkpoint 是怎么协同工作的"
+date: "2026-05-08"
+tag: "Flink"
+description: "从一个 ValueState.update 开始，讲清楚 Flink 为什么需要 RocksDB、RocksDB 如何组织状态、增量 Checkpoint 为什么成立，以及 Barrier Alignment 如何保证分布式一致性。"
+---
+
+很多人第一次理解 Flink RocksDB StateBackend 的时候，会把它简单理解成：
+
+> RocksDB 就是一个磁盘版 HashMap。
+
+这个说法能帮助入门，但它只说对了一小半。
+
+如果只把 RocksDB 当成“把 State 放到磁盘”，就很难继续解释下面这些问题：
+
+- 为什么 Flink 大状态任务更适合用 RocksDB？
+- `ValueState.update()` 到底写到了哪里？
+- 为什么 SST 文件不可变这件事这么关键？
+- Incremental Checkpoint 为什么可以只上传一部分文件？
+- Snapshot 明明没有复制数据库，为什么还能得到一致视图？
+- 多个上游输入同时存在时，Checkpoint 怎么保证 Exactly Once？
+
+这篇文章从最简单的 State 开始，一步步把这条链路讲完整。
+
+核心结论先放在前面：
+
+> Flink RocksDB StateBackend 的本质，不只是“把状态放到磁盘”，而是利用 RocksDB 的 LSM Tree、不可变 SST 文件和 Snapshot 机制，配合 Flink 的 Barrier Checkpoint 协议，在大状态场景下实现可恢复、可扩展、可增量的 Exactly Once 状态管理。
+
+---
+
+## 1. Flink 为什么需要 State？
+
+先看一个最简单的流处理需求：
+
+> 统计每个用户出现了多少次。
+
+输入数据：
+
+```text
+Alice
+Bob
+Alice
+Tom
+Alice
+```
+
+期望输出：
+
+```text
+Alice -> 1
+Bob   -> 1
+Alice -> 2
+Tom   -> 1
+Alice -> 3
+```
+
+对应的 Flink 代码可能是这样：
+
+```java
+stream
+    .keyBy(x -> x)
+    .map(new RichMapFunction<String, String>() {
+
+        private ValueState<Integer> count;
+
+        @Override
+        public void open(Configuration parameters) {
+            ValueStateDescriptor<Integer> descriptor =
+                new ValueStateDescriptor<>("count", Integer.class);
+
+            count = getRuntimeContext().getState(descriptor);
+        }
+
+        @Override
+        public String map(String value) throws Exception {
+            Integer current = count.value();
+
+            if (current == null) {
+                current = 0;
+            }
+
+            current++;
+
+            count.update(current);
+
+            return value + " -> " + current;
+        }
+    });
+```
+
+这里最关键的一行是：
+
+```java
+private ValueState<Integer> count;
+```
+
+`ValueState` 不是普通变量。它表示：
+
+> 在 `keyBy` 之后，每一个 key 都有一份独立的状态。
+
+也就是说，逻辑上 Flink 维护的是这样的数据：
+
+```text
+Alice -> count = 3
+Bob   -> count = 1
+Tom   -> count = 1
+```
+
+这些中间结果，就是 Flink 的 **State**。
+
+如果没有 State，Flink 每来一条数据就只能处理当前这一条，无法记住历史，也就做不了聚合、去重、窗口、Join、CEP 这类真正有价值的流式计算。
+
+---
+
+## 2. StateBackend 解决的是什么问题？
+
+有了 State 之后，下一个问题是：
+
+> 这些状态到底存在哪里？
+
+最容易想到的方案是：直接放 JVM 堆内存。
+
+可以粗略理解成：
+
+```text
+HashMap<Key, State>
+```
+
+例如：
+
+```text
+Alice -> 3
+Bob   -> 1
+Tom   -> 1
+```
+
+这种方式很直观，也很快，因为读写都在内存里。
+
+问题是，真实生产环境里的 State 往往不是几百条、几万条，而可能是几千万、几亿甚至更多。
+
+一旦状态规模变大，单纯依赖 JVM Heap 会遇到几个很现实的问题：
+
+1. **内存容量有限**：状态全部放堆上，很容易把 TaskManager 撑爆。
+2. **GC 压力巨大**：大量 Java 对象会带来频繁 GC，甚至 Full GC。
+3. **Checkpoint 成本高**：状态越大，复制、序列化、上传的成本越高。
+4. **恢复和扩缩容困难**：大状态需要在失败恢复和 rescale 时高效迁移。
+
+所以 Flink 需要 StateBackend。
+
+StateBackend 不是一个业务 API，而是 Flink Runtime 用来管理 State 的底层存储方案。它决定了：
+
+- State 存在 JVM Heap 里，还是 RocksDB 里；
+- State 如何被序列化；
+- Checkpoint 时如何快照；
+- 失败恢复时如何重新加载状态；
+- 并行度变化时如何迁移状态。
+
+在大状态场景下，最常见的选择就是 RocksDB。
+
+---
+
+## 3. 为什么 RocksDB 适合大状态？
+
+RocksDB 可以先粗略理解成一个本地嵌入式 KV 存储引擎。
+
+它不是远程数据库，也不是 Redis 那种独立服务。它会嵌入在 TaskManager 进程里，由 Flink 本地调用。
+
+使用 RocksDB StateBackend 后，代码里的这句：
+
+```java
+count.update(current);
+```
+
+底层就不再只是更新 JVM 里的一个对象，而是把状态写入本地 RocksDB。
+
+一个简单对比：
+
+| 方案 | 状态位置 | 优点 | 问题 |
+|---|---|---|---|
+| Heap StateBackend | JVM Heap | 读写快，实现简单 | 容量受 Heap 限制，GC 压力大 |
+| RocksDB StateBackend | RocksDB 本地存储 | 能承载大状态，Checkpoint 更适合增量化 | 读写需要序列化和本地存储访问，延迟更高 |
+
+所以 RocksDB 并不是所有场景都更快。
+
+它解决的核心问题是：
+
+> 当状态规模大到 JVM Heap 不适合承载时，如何让 Flink 仍然可以稳定运行，并且可以高效 Checkpoint 和恢复。
+
+---
+
+## 4. 一次 `ValueState.update()` 到底发生了什么？
+
+继续看这句代码：
+
+```java
+count.update(5);
+```
+
+从业务视角看，它的意思很简单：
+
+> 把当前 key 对应的 `count` 更新为 5。
+
+但在 Flink Runtime 和 RocksDB 视角，它要经历更多步骤。
+
+### 4.1 Flink 先确定当前 key
+
+因为前面有：
+
+```java
+keyBy(x -> x)
+```
+
+所以当 Flink 处理这条数据时：
+
+```text
+Alice
+```
+
+Runtime 会知道当前 key 是：
+
+```text
+Alice
+```
+
+因此：
+
+```java
+count.update(5);
+```
+
+真正的含义是：
+
+```text
+更新 Alice 这个 key 对应的 count 状态
+```
+
+如果下一条数据是：
+
+```text
+Bob
+```
+
+同样的 `count.update(1)` 更新的就是 Bob 对应的状态。
+
+这也是 Keyed State 的关键：同一段用户代码，在不同 key 上访问的是不同状态。
+
+---
+
+### 4.2 Key 和 Value 都会被序列化
+
+RocksDB 是 KV 存储，但它不认识 Java 对象。
+
+它不认识：
+
+```text
+String
+Integer
+POJO
+List
+Map
+```
+
+它真正认识的是：
+
+```text
+byte[]
+```
+
+所以 Flink 写入 RocksDB 前，会先通过 Serializer 把 key 和 value 序列化成字节。
+
+例如：
+
+```text
+Alice
+```
+
+会变成类似：
+
+```text
+[65, 108, 105, 99, 101]
+```
+
+而：
+
+```text
+5
+```
+
+会变成类似：
+
+```text
+[0, 0, 0, 5]
+```
+
+真实序列化格式由 Flink 的 TypeSerializer 决定，不一定就是上面的样子。这里的例子只是为了说明：**RocksDB 里存的不是 Java 对象，而是字节数组。**
+
+---
+
+### 4.3 RocksDB 里的 key 不是简单的业务 key
+
+很多人会以为 RocksDB 里存的是：
+
+```text
+Alice -> 5
+Bob   -> 1
+```
+
+实际上，Flink 写入 RocksDB 的 key 会包含更多 Runtime 信息。
+
+可以粗略理解为：
+
+```text
+[key-group][user-key][namespace/state-info]
+```
+
+或者更抽象地理解为：
+
+```text
+Flink 内部前缀 + 用户 key + 状态命名空间
+```
+
+为什么不能只用业务 key？
+
+因为 Flink 要支持：
+
+- 一个算子有多个 State；
+- 一个 State 下有多个 key；
+- Window State 还需要 namespace；
+- 任务有并行度；
+- 失败后需要恢复；
+- 调整并行度时需要按 Key Group 迁移。
+
+其中最重要的概念是 **Key Group**。
+
+Flink 会把所有 key 静态划分到一组 Key Group 中：
+
+```text
+0, 1, 2, ..., maxParallelism - 1
+```
+
+每个 key 会通过 hash 映射到某个 Key Group：
+
+```text
+Alice -> key-group 3
+Bob   -> key-group 7
+Tom   -> key-group 3
+```
+
+然后每个 SubTask 负责一段连续的 Key Group 范围：
+
+```text
+SubTask-0 -> key-group 0 ~ 31
+SubTask-1 -> key-group 32 ~ 63
+SubTask-2 -> key-group 64 ~ 95
+SubTask-3 -> key-group 96 ~ 127
+```
+
+这样做的好处是：当 Flink 发生 rescale 时，不需要按每个 key 一个个重新分配，而是按 Key Group 这层逻辑分片迁移状态。
+
+这也是为什么 Flink 的 RocksDB key 编码里一定要带上 Key Group 信息。
+
+---
+
+## 5. RocksDB 为什么不是简单地“修改文件”？
+
+现在问题变成了：
+
+> RocksDB 收到一条 put 请求后，是不是直接去磁盘上找到 Alice，然后把它改成 5？
+
+答案是否定的。
+
+如果每次更新都随机修改磁盘文件，性能会非常差。RocksDB 的核心设计是 LSM Tree，它更偏向于把随机写转换成顺序写和后台合并。
+
+一个普通 RocksDB 写入路径大致是：
+
+```text
+put
+ ↓
+WAL
+ ↓
+MemTable
+ ↓
+Flush
+ ↓
+SST
+ ↓
+Compaction
+```
+
+不过这里要特别注意：
+
+> 普通 RocksDB 会依赖 WAL 保证本地崩溃恢复；但 Flink RocksDB StateBackend 的容错核心是 Checkpoint，不是本地 WAL。很多 Flink 场景下，RocksDB 写入会倾向于关闭 WAL，以减少写放大和本地磁盘开销。
+
+所以理解 WAL 有助于理解 RocksDB 本身，但理解 Flink 时不能误以为“Flink 的 Exactly Once 靠 RocksDB WAL 实现”。
+
+Flink 的容错主线是：
+
+```text
+Barrier + State Snapshot + Checkpoint Storage
+```
+
+而不是：
+
+```text
+RocksDB WAL
+```
+
+---
+
+## 6. MemTable、SST 与 LSM Tree
+
+先不考虑 Flink，只看 RocksDB 自己。
+
+### 6.1 MemTable：先写内存结构
+
+当 RocksDB 收到：
+
+```text
+put Alice 5
+```
+
+它会先写入内存中的 MemTable。
+
+MemTable 可以理解成 RocksDB 的内存写缓冲区，通常用有序结构组织，例如 SkipList。
+
+它的作用是：
+
+- 接收写入；
+- 支持快速查询；
+- 维持 key 的有序性；
+- 后续可以顺序 flush 成磁盘文件。
+
+这一步非常关键：RocksDB 不会每次 put 都去磁盘随机改老文件，而是先把新写入放到 MemTable。
+
+---
+
+### 6.2 SST：MemTable flush 后形成的有序文件
+
+MemTable 不可能无限增长。
+
+当 MemTable 达到一定阈值后，RocksDB 会把它刷到磁盘，形成 SST 文件。
+
+SST 的全称是：
+
+```text
+Sorted String Table
+```
+
+重点在第一个词：
+
+```text
+Sorted
+```
+
+SST 文件内部的 key 是有序的，例如：
+
+```text
+Alice -> 5
+Bob   -> 1
+Tom   -> 2
+```
+
+这种有序性让 RocksDB 可以更高效地查找、范围扫描和合并文件。
+
+---
+
+### 6.3 SST 最大的特点：不可变
+
+SST 文件一旦生成，就不会再原地修改。
+
+如果后面 Alice 又更新了：
+
+```text
+Alice -> 6
+```
+
+RocksDB 不会打开旧 SST 文件，把里面的 Alice 改掉。
+
+它会把新的版本写到 MemTable，之后再生成新的 SST 文件。
+
+于是磁盘上可能同时存在多个版本：
+
+```text
+sst-1: Alice -> 5
+sst-2: Alice -> 6
+```
+
+查询时，RocksDB 会根据内部版本信息找到最新值。
+
+这就是 LSM Tree 的核心思路：
+
+> 不频繁随机修改旧文件，而是持续追加新数据，再通过后台 Compaction 合并旧数据。
+
+---
+
+## 7. 为什么 SST 不可变对 Incremental Checkpoint 很重要？
+
+现在终于可以解释 Flink Incremental Checkpoint 的核心了。
+
+假设第一次 Checkpoint 时，RocksDB 里有两个 SST 文件：
+
+```text
+sst-1
+sst-2
+```
+
+Checkpoint-1 需要把它们上传到远端存储：
+
+```text
+checkpoint-1:
+  sst-1
+  sst-2
+```
+
+之后任务继续运行，新数据不断写入，RocksDB flush 出一个新文件：
+
+```text
+sst-3
+```
+
+因为 SST 文件不可变，所以：
+
+```text
+sst-1 没变
+sst-2 没变
+```
+
+到了 Checkpoint-2，Flink 不需要重新上传已经上传过的 `sst-1` 和 `sst-2`，只需要上传新增的 `sst-3`，并在元数据里记录这些文件之间的引用关系：
+
+```text
+checkpoint-2:
+  引用 sst-1
+  引用 sst-2
+  上传 sst-3
+```
+
+这就是 Incremental Checkpoint 能成立的关键。
+
+它成立的前提不是“RocksDB 存在磁盘上”，而是：
+
+> RocksDB 的持久化文件 SST 是不可变的，所以已经上传过的文件可以被后续 Checkpoint 复用。
+
+当然，真实情况会更复杂。
+
+RocksDB 后台会做 Compaction。Compaction 会读取旧 SST，合并后生成新的 SST。旧 SST 虽然不被原地修改，但可能会被新 SST 替代。
+
+所以 Incremental Checkpoint 并不意味着每次都只上传一点点数据。它只是具备了“复用未变化文件”的能力。实际上传量还会受到写入量、状态更新模式、Compaction、TTL、配置参数等因素影响。
+
+---
+
+## 8. Snapshot 到底是什么？
+
+很多人会误以为：
+
+```text
+snapshot = 把 RocksDB 完整复制一份
+```
+
+如果真是这样，大状态任务每次 Checkpoint 都会非常慢。
+
+RocksDB Snapshot 的关键点是：
+
+> 创建 Snapshot 并不复制整个数据库，而是创建一个一致性读视图。
+
+可以粗略理解为：RocksDB 维护了内部版本。每次写入都会推进版本，Snapshot 记录某个时刻的版本边界。
+
+例如：
+
+| 操作 | key | value | seq |
+|---|---|---:|---:|
+| put | Alice | 1 | 1 |
+| put | Bob | 1 | 2 |
+| put | Alice | 2 | 3 |
+
+当最新序列号是 3 时，创建 Snapshot：
+
+```text
+snapshot(seq = 3)
+```
+
+这个 Snapshot 表示：
+
+```text
+只能看到 seq <= 3 的数据
+```
+
+之后任务继续运行，又写入：
+
+| 操作 | key | value | seq |
+|---|---|---:|---:|
+| put | Alice | 5 | 4 |
+
+此时数据库最新值是：
+
+```text
+Alice -> 5
+```
+
+但刚才创建的 Snapshot 仍然看到：
+
+```text
+Alice -> 2
+```
+
+因为它看到的是创建那一刻的一致视图。
+
+这就解释了为什么 Flink 可以一边继续处理数据，一边异步上传 Checkpoint 文件：
+
+1. 同步阶段快速创建 RocksDB Snapshot；
+2. Snapshot 固定住一个一致视图；
+3. 后续新写入继续进入 RocksDB；
+4. 异步线程基于 Snapshot 对应的文件集合上传状态。
+
+真正阻塞主处理链路的，不应该是整个上传过程，而是创建快照和准备元数据这一小段同步逻辑。
+
+---
+
+## 9. Flink Checkpoint 的整体流程
+
+Flink 的 Checkpoint 不是某个 Task 自己想做就做，而是由 Checkpoint Coordinator 统一触发。
+
+简化流程如下：
+
+```text
+Checkpoint Coordinator
+        │
+        │ 发送 barrier-N
+        ▼
+Source Operator
+        │
+        │ barrier-N 随数据流向下游传播
+        ▼
+Transformation Operator
+        │
+        │ 收到 barrier-N 后 snapshot 自己的状态
+        ▼
+Sink Operator
+```
+
+Barrier 可以理解成插入数据流里的一个特殊标记：
+
+```text
+Alice
+Bob
+[barrier-100]
+Tom
+Jack
+```
+
+它表达的语义是：
+
+```text
+barrier-100 之前的数据，属于 checkpoint-100 之前；
+barrier-100 之后的数据，属于 checkpoint-100 之后。
+```
+
+当一个有状态算子收到 Barrier 后，会对当前状态做快照。
+
+对于 RocksDB StateBackend，简化理解就是：
+
+```text
+收到 barrier
+ ↓
+创建 RocksDB Snapshot
+ ↓
+记录当前需要引用的 SST 文件
+ ↓
+异步上传新增 SST 和元数据
+ ↓
+Checkpoint 完成
+```
+
+这里有两个阶段需要区分：
+
+| 阶段 | 做什么 | 是否阻塞处理 |
+|---|---|---|
+| 同步阶段 | 创建一致性快照，准备元数据 | 会短暂阻塞 |
+| 异步阶段 | 上传文件到 HDFS/S3/OSS 等远端存储 | 不应该长时间阻塞主处理 |
+
+所以说 Checkpoint 快，并不是因为上传一定快，而是因为 Flink 尽量把耗时的 I/O 上传放到了异步阶段。
+
+---
+
+## 10. Barrier Alignment：分布式一致性的关键
+
+单个 RocksDB 实例创建 Snapshot，只能保证一个 Task 内部状态一致。
+
+但 Flink 是分布式 DAG。
+
+一个算子可能有多个上游输入，例如：
+
+```text
+source-1 ──┐
+           ├── join operator
+source-2 ──┘
+```
+
+这时问题来了：
+
+如果 `source-1` 的 barrier 已经到了，但 `source-2` 的 barrier 还没到，Join 算子能不能立刻做 Checkpoint？
+
+不能。
+
+因为这样会导致状态视图不一致。
+
+假设数据流是这样：
+
+```text
+source-1: A1 A2 [barrier-100] A3 A4
+source-2: B1 B2 B3 B4 [barrier-100]
+```
+
+当 Join 算子先收到 source-1 的 `barrier-100` 时，source-2 可能还在继续发送 checkpoint-100 之前的数据。
+
+如果这时直接 snapshot，就可能出现：
+
+```text
+source-1 已经切到 checkpoint-100 之后
+source-2 还停留在 checkpoint-100 之前
+```
+
+这不是一个一致的全局切面。
+
+Barrier Alignment 的做法是：
+
+1. 某个输入 channel 的 barrier 先到；
+2. 这个 channel 后续的数据先暂停处理或缓存；
+3. 其他还没到 barrier 的 channel 继续处理；
+4. 等所有输入 channel 的同一个 barrier 都到齐；
+5. 算子再对状态做 snapshot；
+6. 然后继续向下游广播 barrier。
+
+可以想象成：
+
+```text
+source-1: A1 A2 [barrier-100] | A3 A4 先等着
+source-2: B1 B2 B3 B4 [barrier-100]
+```
+
+等两个输入都到达 `barrier-100`，此时算子的状态就对应同一个一致切面。
+
+这就是 Flink 分布式 Checkpoint 能保证一致性的关键。
+
+---
+
+## 11. 为什么 Checkpoint 会卡？
+
+Barrier Alignment 虽然保证了一致性，但也会带来性能问题。
+
+如果多个输入 channel 速度差异很大：
+
+```text
+channel-1 很快
+channel-2 很慢
+```
+
+那么 `channel-1` 的 barrier 可能很早到达，而 `channel-2` 的 barrier 迟迟不到。
+
+这时 Flink 需要让已经到达 barrier 的 channel 等待，等待期间后续数据可能被阻塞或缓存。
+
+于是可能出现：
+
+- Checkpoint alignment time 变长；
+- 端到端延迟上升；
+- buffer 占用增加；
+- 反压加剧；
+- Checkpoint 超时；
+- Checkpoint 失败后继续重试，进一步拖垮任务。
+
+所以生产里看到 Checkpoint 慢，不要只盯着 RocksDB 文件上传。
+
+还要看：
+
+- Barrier Alignment 是否耗时；
+- 是否存在反压；
+- 某些上游 SubTask 是否特别慢；
+- State 是否过大；
+- RocksDB Compaction 是否频繁；
+- Checkpoint Storage 上传带宽是否不足；
+- 增量 Checkpoint 是否因为大量新 SST/Compaction 失效。
+
+---
+
+## 12. Unaligned Checkpoint 解决了什么？
+
+Barrier Alignment 的问题在于：
+
+> 为了等 barrier 对齐，快 channel 可能被慢 channel 拖住。
+
+Unaligned Checkpoint 的思路是：
+
+> 不强制等待所有 channel 完全对齐，而是把正在传输中的 channel buffer 也作为 Checkpoint 的一部分保存下来。
+
+也就是说，Checkpoint 不只保存 Operator State 和 Keyed State，还保存一部分网络输入缓冲。
+
+这样即使 barrier 没完全对齐，也能形成可恢复的一致状态。
+
+简化理解：
+
+```text
+Aligned Checkpoint:
+  等所有 barrier 到齐，再 snapshot operator state
+
+Unaligned Checkpoint:
+  不等慢 channel，把 channel buffer 也一起 snapshot
+```
+
+它适合在反压明显、alignment time 很长的场景下降低 Checkpoint 延迟。
+
+但它不是银弹。
+
+因为它会把网络 buffer 也写入 Checkpoint，可能增加 Checkpoint 大小和恢复成本。是否启用，需要结合任务的反压情况、状态大小、恢复目标和资源条件一起判断。
+
+---
+
+## 13. Exactly Once 到底靠什么保证？
+
+很多人会把 Exactly Once 简化成：
+
+```text
+Flink 有 Checkpoint，所以 Exactly Once
+```
+
+这个说法不够准确。
+
+Exactly Once 至少依赖三部分协同：
+
+### 13.1 Source 可重放
+
+Source 必须能从某个位置重新消费。
+
+Kafka Source 的典型例子就是 offset。
+
+Checkpoint 会记录：
+
+```text
+topic / partition / offset
+```
+
+失败恢复时，Source 从 Checkpoint 里的 offset 继续读。
+
+---
+
+### 13.2 State 可恢复
+
+有状态算子的状态必须能恢复到同一个一致切面。
+
+这就是 RocksDB StateBackend 和 Checkpoint 负责的部分。
+
+恢复时，Flink 会从远端 Checkpoint Storage 下载或引用对应状态文件，重新构造出 Task 当时的状态。
+
+---
+
+### 13.3 Sink 支持事务或幂等
+
+如果 Sink 已经把结果写到外部系统，但任务失败后又重放了一部分数据，就可能重复写。
+
+所以 Sink 也必须配合。
+
+常见方式包括：
+
+- 两阶段提交；
+- 事务写入；
+- 幂等写入；
+- upsert 语义；
+- 外部系统支持 exactly-once commit。
+
+因此，Flink 的 Exactly Once 不是单点能力，而是一条端到端链路：
+
+```text
+Source offset
+   +
+State checkpoint
+   +
+Sink commit protocol
+   =
+End-to-end Exactly Once
+```
+
+RocksDB 只解决其中的 State 部分。
+
+---
+
+## 14. 把完整链路串起来
+
+现在可以把整件事串成一条线：
+
+```text
+数据进入 Source
+ ↓
+Source 记录可重放位置，例如 Kafka offset
+ ↓
+数据经过 keyBy
+ ↓
+Flink 根据 key 找到对应 Key Group
+ ↓
+用户代码访问 ValueState / MapState / ListState
+ ↓
+State 被序列化成 byte[]
+ ↓
+写入本地 RocksDB
+ ↓
+RocksDB 写入 MemTable，之后 flush 成不可变 SST
+ ↓
+Checkpoint Coordinator 注入 barrier
+ ↓
+barrier 沿着数据流向下游传播
+ ↓
+有状态算子收到 barrier
+ ↓
+多输入场景下进行 Barrier Alignment
+ ↓
+RocksDB 创建一致性 Snapshot
+ ↓
+Flink 记录当前需要引用的 SST 文件
+ ↓
+新增 SST 和元数据异步上传到 Checkpoint Storage
+ ↓
+Checkpoint 完成
+ ↓
+失败时从最近一次成功 Checkpoint 恢复 Source offset 和 State
+ ↓
+Sink 通过事务/幂等协议避免重复提交
+```
+
+这条链路里，RocksDB、Checkpoint、Barrier、Source offset、Sink commit 各自解决不同问题。
+
+---
+
+## 15. 最后总结
+
+Flink RocksDB 与 Checkpoint 的关系，可以压缩成三句话：
+
+第一，**RocksDB 解决的是大状态的本地存储问题**。
+
+它让 State 不必全部堆在 JVM Heap 里，从而降低 OOM 和 GC 风险，使 Flink 能处理更大规模的 Keyed State。
+
+第二，**不可变 SST 文件是 Incremental Checkpoint 的基础**。
+
+因为旧 SST 不会原地修改，已经上传过的文件可以被后续 Checkpoint 复用，Flink 才能在大状态任务中避免每次全量上传。
+
+第三，**Barrier 协议解决的是分布式一致性问题**。
+
+单个 RocksDB Snapshot 只能保证一个 Task 内部一致。Flink 通过 Barrier Alignment 在整个 DAG 中构造一致切面，再配合 Source 和 Sink 的协议，最终实现端到端 Exactly Once。
+
+所以，真正理解 Flink RocksDB StateBackend，不能只停留在：
+
+```text
+RocksDB = 磁盘版 HashMap
+```
+
+更准确的理解应该是：
+
+> RocksDB 提供大状态本地存储和可增量快照的物理基础；Flink Checkpoint 协议在分布式数据流上构造一致切面；二者结合，才让大状态流处理既能跑得动，又能在失败后正确恢复。

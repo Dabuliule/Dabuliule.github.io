@@ -1,0 +1,902 @@
+---
+title: "Agent Runtime 里的 EventBus：把执行过程变成事件流"
+date: "2026-05-20"
+tag: "Agent Runtime"
+description: "EventBus 看起来只是一个很小的发布订阅组件，但它解决的是 Agent Runtime 中核心编排逻辑与日志、UI、Trace、持久化等副作用强耦合的问题。"
+---
+
+在写 Agent Runtime 的时候，一开始很容易只关注三个问题：
+
+1. Agent 怎么决策；
+2. Tool 怎么执行；
+3. 最终答案怎么返回。
+
+但是 Runtime 真正跑起来之后，很快会遇到另一个更工程化的问题：
+
+> Agent 执行过程中发生了什么，我怎么把它展示出来、记录下来、调试出来？
+
+比如一次任务执行可能是这样的：
+
+```text
+用户输入任务
+Agent 产生 thought
+Agent 选择 action
+Executor 执行 tool
+Tool 返回 observation
+Agent 根据 observation 继续决策
+最终输出 final answer
+```
+
+如果这些信息只存在于 Runtime 内部变量里，那么对外部来说，这个 Agent 就是一个黑盒。
+
+用户只能等最终答案。
+
+开发者也只能等它失败以后再去翻日志。
+
+这对于普通函数来说可能够用，但对于 Agent Runtime 来说远远不够。因为 Agent 的价值不只在最终答案，也在它的执行轨迹。
+
+所以我们需要一个机制，把 Runtime 内部发生的事情“发出来”。
+
+这就是 EventBus 的作用。
+
+---
+
+## 先看代码
+
+```python
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from inspect import isawaitable
+
+from agent_runtime.schema.event import RuntimeEvent
+
+EventHandler = Callable[[RuntimeEvent], Awaitable[None]]
+
+
+class EventBus:
+    """
+    Minimal async event bus for runtime events.
+
+    Handlers are called in subscription order. Handler exceptions propagate to
+    the caller so orchestration code can fail fast instead of hiding side
+    effects that did not run.
+    """
+
+    def __init__(self) -> None:
+        self._handlers: list[EventHandler] = []
+
+    def subscribe(
+            self,
+            handler: EventHandler,
+    ) -> None:
+        self._handlers.append(handler)
+
+    async def emit(
+            self,
+            event: RuntimeEvent,
+    ) -> None:
+        for handler in list(self._handlers):
+            result = handler(event)
+
+            if not isawaitable(result):
+                raise TypeError(
+                    "EventBus handler must be an async callable"
+                )
+
+            await result
+```
+
+这段代码很短。
+
+短到看起来好像没什么东西。
+
+但它解决的是 Agent Runtime 里非常核心的一个问题：
+
+> 如何把 Runtime 主流程和各种副作用解耦。
+
+---
+
+## 没有 EventBus 会怎么样
+
+假设没有 EventBus，Runtime 里很可能会直接写这些东西：
+
+```python
+print(thought)
+logger.info(action)
+ui.render(observation)
+db.save(step)
+trace.record(event)
+```
+
+一开始这看起来没什么问题。
+
+但是功能继续加下去，Runtime 会慢慢变成这样：
+
+```text
+AgentRuntime
+├── 负责调用 Agent
+├── 负责调用 Executor
+├── 负责判断是否结束
+├── 负责打印日志
+├── 负责更新终端 UI
+├── 负责保存数据库
+├── 负责记录 trace
+├── 负责推送 WebSocket
+└── 负责处理各种副作用异常
+```
+
+这就坏了。
+
+因为 `AgentRuntime` 的核心职责应该是编排，也就是：
+
+```text
+Agent 决策 → Tool 执行 → 状态更新 → 下一轮决策
+```
+
+至于“这个过程要不要打印出来”、“要不要保存到数据库”、“要不要推给前端”、“要不要写 trace”，都不应该污染 Runtime 主流程。
+
+EventBus 的价值就在这里。
+
+它在 Runtime 和外部副作用之间加了一层事件边界。
+
+---
+
+## EventBus 的核心思想
+
+EventBus 的结构可以理解成这样：
+
+```text
+AgentRuntime
+    |
+    | emit(event)
+    v
+EventBus
+    |
+    | dispatch
+    v
+Handlers
+    ├── ConsoleRenderer
+    ├── JsonLogger
+    ├── TraceRecorder
+    ├── DatabaseSaver
+    └── WebSocketPusher
+```
+
+Runtime 只负责发事件：
+
+```python
+await event_bus.emit(event)
+```
+
+至于谁关心这个事件，由外部注册 handler：
+
+```python
+event_bus.subscribe(console_handler)
+event_bus.subscribe(trace_handler)
+event_bus.subscribe(db_handler)
+```
+
+这样 Runtime 不需要知道自己后面接的是终端、日志系统、数据库，还是 WebSocket。
+
+它只需要知道：
+
+> 当前发生了一个 RuntimeEvent，我把它发出去。
+
+这就是解耦。
+
+---
+
+## RuntimeEvent 是 Agent 的执行语言
+
+EventBus 本身只是负责分发。
+
+真正有意义的是 `RuntimeEvent`。
+
+比如可以定义这些事件：
+
+```python
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+class RuntimeEvent(BaseModel):
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class ThoughtEvent(RuntimeEvent):
+    thought: str
+
+
+class ActionEvent(RuntimeEvent):
+    tool: str
+    tool_input: dict[str, Any]
+
+
+class ObservationEvent(RuntimeEvent):
+    content: str
+    success: bool
+
+
+class WarningEvent(RuntimeEvent):
+    message: str
+
+
+class FinalResultEvent(RuntimeEvent):
+    answer: str
+```
+
+这些事件其实是在定义 Agent Runtime 的执行语言。
+
+一次 Agent 执行过程可以被表达成：
+
+```text
+ThoughtEvent       -> Agent 想到了什么
+ActionEvent        -> Agent 准备调用什么工具
+ObservationEvent   -> 工具返回了什么结果
+WarningEvent       -> 中途出现了什么风险
+FinalResultEvent   -> 最终答案是什么
+```
+
+有了这些事件，Runtime 的执行过程就不再只是内部状态，而是一个可以被外部消费的事件流。
+
+这非常关键。
+
+因为 Agent Runtime 不是传统后端里的普通函数调用。
+
+普通函数通常只关心返回值。
+
+但是 Agent 不一样。
+
+Agent 的执行过程可能很长，可能多轮，可能失败，可能重试，可能调用很多工具。
+
+所以你需要把它变成一个可观察的过程。
+
+---
+
+## 为什么 handler 必须是 async
+
+代码里有一个关键设计：
+
+```python
+EventHandler = Callable[[RuntimeEvent], Awaitable[None]]
+```
+
+这表示所有 handler 都必须是异步函数。
+
+也就是说，handler 应该这样写：
+
+```python
+async def console_handler(event: RuntimeEvent) -> None:
+    print(event)
+```
+
+而不是这样写：
+
+```python
+def console_handler(event: RuntimeEvent) -> None:
+    print(event)
+```
+
+这不是为了显得高级，而是为了统一 Runtime 的异步模型。
+
+Agent Runtime 里很多操作天然就是异步的：
+
+```text
+LLM 调用
+Tool 调用
+文件 IO
+网络请求
+数据库写入
+WebSocket 推送
+日志上报
+```
+
+如果 EventBus 允许同步 handler 和异步 handler 混用，表面上看起来更灵活，但 Runtime 内部会变复杂。
+
+你需要到处判断：
+
+```python
+result = handler(event)
+
+if isawaitable(result):
+    await result
+else:
+    ...
+```
+
+而这个 EventBus 选择了更严格的方式：
+
+```python
+if not isawaitable(result):
+    raise TypeError(
+        "EventBus handler must be an async callable"
+    )
+```
+
+也就是说：
+
+> 你要订阅 Runtime 事件，就必须提供 async handler。
+
+这个设计是合理的。
+
+因为越核心的框架组件，越不应该为了兼容各种写法而牺牲一致性。
+
+---
+
+## 为什么还要用 isawaitable 检查
+
+有人可能会问：
+
+既然类型已经写了：
+
+```python
+EventHandler = Callable[[RuntimeEvent], Awaitable[None]]
+```
+
+那为什么运行时还要检查？
+
+因为 Python 的类型提示不是强制的。
+
+你完全可以写出这样的代码：
+
+```python
+def bad_handler(event: RuntimeEvent) -> None:
+    print(event)
+
+
+event_bus.subscribe(bad_handler)
+```
+
+类型检查器可能会提示你不对，但是运行时不会自动拦住你。
+
+如果没有 `isawaitable` 检查，那么执行到这里：
+
+```python
+await result
+```
+
+就会变成：
+
+```python
+await None
+```
+
+然后抛出一个不够直观的错误。
+
+而现在这段代码会明确告诉你：
+
+```text
+EventBus handler must be an async callable
+```
+
+这对框架代码很重要。
+
+框架代码应该尽量让错误发生在边界处，并且错误信息要清楚。
+
+---
+
+## 为什么按订阅顺序执行 handler
+
+这段代码表示 handler 会按订阅顺序执行：
+
+```python
+for handler in list(self._handlers):
+    ...
+```
+
+比如：
+
+```python
+event_bus.subscribe(trace_handler)
+event_bus.subscribe(console_handler)
+event_bus.subscribe(db_handler)
+```
+
+那么每次事件发生时，执行顺序就是：
+
+```text
+trace_handler
+console_handler
+db_handler
+```
+
+这不是随便的。
+
+对于 Runtime 事件来说，顺序通常很重要。
+
+比如你可能希望：
+
+```text
+先记录 trace
+再打印到终端
+最后保存到数据库
+```
+
+如果 EventBus 默认并发执行所有 handler，虽然可能更快，但是副作用顺序就不稳定了。
+
+对于一个早期 Agent Runtime 来说，顺序派发更合适。
+
+它有几个好处：
+
+```text
+行为简单
+顺序可预测
+容易调试
+异常位置明确
+```
+
+不是所有地方一上来都要并发。
+
+尤其是在 Runtime 这种核心链路里，确定性往往比一点点性能更重要。
+
+---
+
+## 为什么 emit 里要复制 handlers 列表
+
+这里还有一个细节：
+
+```python
+for handler in list(self._handlers):
+```
+
+它没有直接写成：
+
+```python
+for handler in self._handlers:
+```
+
+这是为了避免遍历过程中 `_handlers` 被修改。
+
+比如某个 handler 执行时，又注册了一个新的 handler：
+
+```python
+async def handler(event: RuntimeEvent) -> None:
+    event_bus.subscribe(another_handler)
+```
+
+如果你直接遍历原始列表，就会出现一些很混乱的问题：
+
+```text
+新 handler 要不要接收当前这个 event？
+当前循环长度会不会变化？
+会不会跳过某些 handler？
+```
+
+而 `list(self._handlers)` 的意思是：
+
+> 本次 emit 只使用当前这一刻的 handler 快照。
+
+也就是说：
+
+当前事件只发给当前已经订阅的 handler。
+
+新注册的 handler 从下一次事件开始生效。
+
+这个语义更稳定。
+
+---
+
+## 为什么 handler 异常要向外抛
+
+代码注释里有一句很重要的话：
+
+```text
+Handler exceptions propagate to the caller so orchestration code can fail fast
+instead of hiding side effects that did not run.
+```
+
+意思是：
+
+> 如果 handler 失败，EventBus 不会偷偷吞掉异常，而是让异常直接向外抛。
+
+比如：
+
+```python
+async def db_handler(event: RuntimeEvent) -> None:
+    raise RuntimeError("database write failed")
+```
+
+那么：
+
+```python
+await event_bus.emit(event)
+```
+
+会直接失败。
+
+这叫 fail fast。
+
+有些人可能会觉得：
+
+> 日志失败了，为什么要影响 Agent 主流程？
+
+这个问题要看 EventBus 承担的职责。
+
+如果 EventBus 只是用来打印一些可有可无的日志，那 handler 异常确实可以吞掉。
+
+但在 Agent Runtime 里，事件不一定只是日志。
+
+它可能承担这些职责：
+
+```text
+保存执行轨迹
+记录审计日志
+写入 trace 系统
+推送前端状态
+持久化 step
+```
+
+如果这些副作用失败了，但 Runtime 还假装成功继续跑，最后可能会出现更麻烦的状态：
+
+```text
+用户看到任务成功了
+但是数据库里没有执行记录
+trace 系统缺了一半
+前端状态和真实状态不一致
+审计日志丢失
+```
+
+对于框架早期实现来说，不吞异常是更安全的选择。
+
+因为它让问题暴露出来，而不是隐藏起来。
+
+---
+
+## EventBus 在 Runtime 里的使用方式
+
+假设 Runtime 主循环是这样的：
+
+```python
+class AgentRuntime:
+    def __init__(
+            self,
+            agent: Agent,
+            executor: Executor,
+            event_bus: EventBus,
+    ) -> None:
+        self.agent = agent
+        self.executor = executor
+        self.event_bus = event_bus
+
+    async def arun(self, task: str) -> AgentResult:
+        state = AgentState(task=task)
+
+        while not state.done:
+            decision = await self.agent.astep(state)
+
+            await self.event_bus.emit(
+                ThoughtEvent(thought=decision.thought)
+            )
+
+            await self.event_bus.emit(
+                ActionEvent(
+                    tool=decision.action.tool,
+                    tool_input=decision.action.tool_input,
+                )
+            )
+
+            step = await self.executor.execute(decision.action)
+            state.history.append(step)
+
+            await self.event_bus.emit(
+                ObservationEvent(
+                    content=step.observation.content,
+                    success=step.observation.success,
+                )
+            )
+
+            if decision.action.tool == "final_answer":
+                state.done = True
+                state.final_answer = step.observation.content
+
+                await self.event_bus.emit(
+                    FinalResultEvent(answer=state.final_answer)
+                )
+
+        return AgentResult(
+            success=True,
+            answer=state.final_answer,
+            steps=state.history,
+        )
+```
+
+这样 Runtime 仍然只关心核心流程：
+
+```text
+决策
+执行
+更新状态
+判断结束
+```
+
+事件怎么处理，交给外部 handler。
+
+---
+
+## 一个终端渲染 handler
+
+比如可以写一个终端渲染器：
+
+```python
+async def console_handler(event: RuntimeEvent) -> None:
+    if isinstance(event, ThoughtEvent):
+        print(f"思考：{event.thought}")
+
+    elif isinstance(event, ActionEvent):
+        print(f"动作：{event.tool}")
+        print(f"参数：{event.tool_input}")
+
+    elif isinstance(event, ObservationEvent):
+        print(f"结果：{event.content}")
+
+    elif isinstance(event, WarningEvent):
+        print(f"警告：{event.message}")
+
+    elif isinstance(event, FinalResultEvent):
+        print(f"最终答案：{event.answer}")
+```
+
+然后注册：
+
+```python
+event_bus = EventBus()
+event_bus.subscribe(console_handler)
+```
+
+Runtime 里不需要出现任何 `print`。
+
+这就是收益。
+
+---
+
+## 一个 JSON 日志 handler
+
+也可以写一个 JSON logger：
+
+```python
+async def json_log_handler(event: RuntimeEvent) -> None:
+    print(event.model_dump_json())
+```
+
+注册之后，所有 RuntimeEvent 都可以被结构化输出。
+
+```python
+event_bus.subscribe(json_log_handler)
+```
+
+这样比在 Runtime 里到处写 logger 更干净。
+
+因为 Runtime 不需要知道日志格式。
+
+---
+
+## 一个 WebSocket handler
+
+如果后面要做成类似 Codex CLI 或者 Web UI，EventBus 也可以继续复用。
+
+比如：
+
+```python
+async def websocket_handler(event: RuntimeEvent) -> None:
+    await websocket.send_json(event.model_dump(mode="json"))
+```
+
+这样前端就可以实时看到 Agent 的执行过程：
+
+```text
+正在思考...
+正在调用 read_file...
+读取成功...
+正在总结...
+输出最终答案...
+```
+
+这会比“等很久，然后突然返回一个答案”的体验好很多。
+
+Agent 产品的交互体验，很多时候不是靠最终答案撑起来的，而是靠执行过程撑起来的。
+
+用户要知道系统正在做事。
+
+开发者也要知道系统卡在哪里。
+
+---
+
+## EventBus 不是消息队列
+
+这里要注意一点：
+
+这个 EventBus 不是 Kafka，也不是 RabbitMQ，也不是 Celery。
+
+它不是分布式消息队列。
+
+它不解决这些问题：
+
+```text
+跨进程通信
+消息持久化
+消费组
+重试队列
+削峰填谷
+```
+
+它解决的是一个更小、更直接的问题：
+
+```text
+Runtime 内部事件如何被多个观察者消费
+```
+
+所以它应该保持简单。
+
+你现在这个实现其实是对的。
+
+它没有过度设计。
+
+---
+
+## 什么时候需要升级这个 EventBus
+
+当前实现适合早期 Runtime。
+
+但如果后面需求变复杂，可以逐步升级。
+
+### 支持取消订阅
+
+现在只能 `subscribe`，不能 `unsubscribe`。
+
+可以让 `subscribe` 返回一个取消订阅函数：
+
+```python
+from collections.abc import Callable
+
+def subscribe(self, handler: EventHandler) -> Callable[[], None]:
+    self._handlers.append(handler)
+
+    def unsubscribe() -> None:
+        self._handlers.remove(handler)
+
+    return unsubscribe
+```
+
+这样外部就可以取消订阅。
+
+---
+
+### 支持并发派发
+
+如果 handler 之间没有顺序依赖，可以并发执行：
+
+```python
+import asyncio
+
+await asyncio.gather(
+    *(handler(event) for handler in list(self._handlers))
+)
+```
+
+但是这会改变语义。
+
+顺序不再稳定，异常处理也更复杂。
+
+所以不建议一开始就做。
+
+---
+
+### 支持错误隔离
+
+如果你希望某个 handler 失败不影响 Runtime，可以设计错误策略：
+
+```python
+try:
+    await result
+except Exception as exc:
+    ...
+```
+
+但这里要谨慎。
+
+吞异常会让系统看起来更健壮，但也会让问题更隐蔽。
+
+更好的方式是显式设计错误策略：
+
+```python
+EventBus(error_policy="raise")
+EventBus(error_policy="log_and_continue")
+```
+
+不要一开始就偷偷吞掉异常。
+
+默认 fail fast 更适合框架早期阶段。
+
+---
+
+### 支持事件过滤
+
+以后 handler 可能只关心某一种事件。
+
+比如：
+
+```python
+event_bus.subscribe(ThoughtEvent, thought_handler)
+event_bus.subscribe(ActionEvent, action_handler)
+```
+
+但这会增加接口复杂度。
+
+在 Runtime 还不大的时候，让 handler 自己判断事件类型就够了：
+
+```python
+async def handler(event: RuntimeEvent) -> None:
+    if isinstance(event, ThoughtEvent):
+        ...
+```
+
+先保持简单，后面真的需要再抽象。
+
+---
+
+## 这个设计真正解决了什么痛点
+
+这个 EventBus 看起来只是一个小工具。
+
+但它背后其实有一个重要判断：
+
+> Agent Runtime 的执行过程本身就是产品能力的一部分。
+
+传统函数调用通常只关心返回值。
+
+但是 Agent 不一样。
+
+Agent 的执行过程同样重要。
+
+用户需要知道它为什么这么做。
+
+开发者需要知道它在哪里失败。
+
+系统需要记录它调用过什么工具。
+
+前端需要实时展示它执行到了哪一步。
+
+审计系统需要保存它的行为轨迹。
+
+这些东西都依赖事件。
+
+所以 EventBus 不是为了“套设计模式”。
+
+它是为了让 Runtime 从一开始就具备可观察性、可调试性和可扩展性。
+
+---
+
+## 总结
+
+这个 EventBus 解决的不是“怎么调用一个函数”的问题。
+
+它解决的是 Agent Runtime 里的一个核心工程问题：
+
+> 如何在不污染 Runtime 主流程的情况下，把执行过程暴露给日志、UI、Trace、持久化和调试系统。
+
+它的几个设计点都很有意义：
+
+```text
+subscribe 注册观察者
+emit 统一派发事件
+handler 必须 async
+handler 按订阅顺序执行
+emit 使用 handler 快照
+handler 异常直接向外抛
+Runtime 不直接依赖 UI、Logger、DB
+```
+
+最后，Runtime 的边界会变得非常清晰：
+
+```text
+AgentRuntime 负责执行
+EventBus 负责分发事件
+Handler 负责处理副作用
+```
+
+对于一个 Agent Runtime 项目来说，EventBus 虽然很小，但它是从“能跑”走向“可观察、可调试、可扩展”的关键一步。
