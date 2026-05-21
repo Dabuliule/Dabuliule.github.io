@@ -28,7 +28,7 @@ description: "从一个 ValueState.update 开始，讲清楚 Flink 为什么需�
 
 ---
 
-## 1. Flink 为什么需要 State？
+## Flink 为什么需要 State？
 
 先看一个最简单的流处理需求：
 
@@ -112,7 +112,7 @@ Tom   -> count = 1
 
 ---
 
-## 2. StateBackend 解决的是什么问题？
+## StateBackend 解决的是什么问题？
 
 有了 State 之后，下一个问题是：
 
@@ -159,7 +159,7 @@ StateBackend 不是一个业务 API，而是 Flink Runtime 用来管理 State �
 
 ---
 
-## 3. 为什么 RocksDB 适合大状态？
+## 为什么 RocksDB 适合大状态？
 
 RocksDB 可以先粗略理解成一个本地嵌入式 KV 存储引擎。
 
@@ -188,7 +188,7 @@ count.update(current);
 
 ---
 
-## 4. 一次 `ValueState.update()` 到底发生了什么？
+## 一次 `ValueState.update()` 到底发生了什么？
 
 继续看这句代码：
 
@@ -202,7 +202,7 @@ count.update(5);
 
 但在 Flink Runtime 和 RocksDB 视角，它要经历更多步骤。
 
-### 4.1 Flink 先确定当前 key
+### Flink 先确定当前 key
 
 因为前面有：
 
@@ -246,7 +246,7 @@ Bob
 
 ---
 
-### 4.2 Key 和 Value 都会被序列化
+### Key 和 Value 都会被序列化
 
 RocksDB 是 KV 存储，但它不认识 Java 对象。
 
@@ -296,7 +296,7 @@ Alice
 
 ---
 
-### 4.3 RocksDB 里的 key 不是简单的业务 key
+### RocksDB 里的 key 不是简单的业务 key
 
 很多人会以为 RocksDB 里存的是：
 
@@ -361,7 +361,7 @@ SubTask-3 -> key-group 96 ~ 127
 
 ---
 
-## 5. RocksDB 为什么不是简单地“修改文件”？
+## RocksDB 为什么不是简单地“修改文件”？
 
 现在问题变成了：
 
@@ -407,11 +407,11 @@ RocksDB WAL
 
 ---
 
-## 6. MemTable、SST 与 LSM Tree
+## MemTable、SST 与 LSM Tree
 
 先不考虑 Flink，只看 RocksDB 自己。
 
-### 6.1 MemTable：先写内存结构
+### MemTable：先写内存结构
 
 当 RocksDB 收到：
 
@@ -434,7 +434,7 @@ MemTable 可以理解成 RocksDB 的内存写缓冲区，通常用有序结构�
 
 ---
 
-### 6.2 SST：MemTable flush 后形成的有序文件
+### SST：MemTable flush 后形成的有序文件
 
 MemTable 不可能无限增长。
 
@@ -464,7 +464,7 @@ Tom   -> 2
 
 ---
 
-### 6.3 SST 最大的特点：不可变
+### SST 最大的特点：不可变
 
 SST 文件一旦生成，就不会再原地修改。
 
@@ -493,7 +493,7 @@ sst-2: Alice -> 6
 
 ---
 
-## 7. 为什么 SST 不可变对 Incremental Checkpoint 很重要？
+## 为什么 SST 不可变对 Incremental Checkpoint 很重要？
 
 现在终于可以解释 Flink Incremental Checkpoint 的核心了。
 
@@ -548,7 +548,7 @@ RocksDB 后台会做 Compaction。Compaction 会读取旧 SST，合并后生成�
 
 ---
 
-## 8. Snapshot 到底是什么？
+## Snapshot 到底是什么？
 
 很多人会误以为：
 
@@ -615,7 +615,7 @@ Alice -> 2
 
 ---
 
-## 9. Flink Checkpoint 的整体流程
+## Flink Checkpoint 的整体流程
 
 Flink 的 Checkpoint 不是某个 Task 自己想做就做，而是由 Checkpoint Coordinator 统一触发。
 
@@ -681,7 +681,7 @@ Checkpoint 完成
 
 ---
 
-## 10. Barrier Alignment：分布式一致性的关键
+## Barrier Alignment：分布式一致性的关键
 
 单个 RocksDB 实例创建 Snapshot，只能保证一个 Task 内部状态一致。
 
@@ -743,7 +743,7 @@ source-2: B1 B2 B3 B4 [barrier-100]
 
 ---
 
-## 11. 为什么 Checkpoint 会卡？
+## 为什么 Checkpoint 会卡？
 
 Barrier Alignment 虽然保证了一致性，但也会带来性能问题。
 
@@ -781,7 +781,7 @@ channel-2 很慢
 
 ---
 
-## 12. Unaligned Checkpoint 解决了什么？
+## Unaligned Checkpoint 解决了什么？
 
 Barrier Alignment 的问题在于：
 
@@ -813,7 +813,7 @@ Unaligned Checkpoint:
 
 ---
 
-## 13. Exactly Once 到底靠什么保证？
+## Exactly Once 到底靠什么保证？
 
 很多人会把 Exactly Once 简化成：
 
@@ -825,7 +825,7 @@ Flink 有 Checkpoint，所以 Exactly Once
 
 Exactly Once 至少依赖三部分协同：
 
-### 13.1 Source 可重放
+### Source 可重放
 
 Source 必须能从某个位置重新消费。
 
@@ -841,7 +841,7 @@ topic / partition / offset
 
 ---
 
-### 13.2 State 可恢复
+### State 可恢复
 
 有状态算子的状态必须能恢复到同一个一致切面。
 
@@ -851,7 +851,7 @@ topic / partition / offset
 
 ---
 
-### 13.3 Sink 支持事务或幂等
+### Sink 支持事务或幂等
 
 如果 Sink 已经把结果写到外部系统，但任务失败后又重放了一部分数据，就可能重复写。
 
@@ -881,7 +881,7 @@ RocksDB 只解决其中的 State 部分。
 
 ---
 
-## 14. 把完整链路串起来
+## 把完整链路串起来
 
 现在可以把整件事串成一条线：
 
@@ -927,7 +927,7 @@ Sink 通过事务/幂等协议避免重复提交
 
 ---
 
-## 15. 最后总结
+## 最后总结
 
 Flink RocksDB 与 Checkpoint 的关系，可以压缩成三句话：
 
