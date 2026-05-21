@@ -6,7 +6,10 @@ import { metaSchema, pageSchema } from 'fumadocs-core/source/schema';
 export const docs = defineDocs({
   dir: 'content/docs',
   docs: {
-    schema: pageSchema,
+    schema: pageSchema.extend({
+      date: pageSchema.shape.title.optional(),
+      tag: pageSchema.shape.title.optional(),
+    }),
     postprocess: {
       includeProcessedMarkdown: true,
     },
