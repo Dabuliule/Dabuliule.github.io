@@ -1,0 +1,1108 @@
+---
+title: "Flink REST API 是怎么实现的"
+date: "2026-06-08"
+tag: "Flink"
+description: "从 RestServerEndpoint、WebMonitorEndpoint、MessageHeaders 和 AbstractRestHandler 四条线，拆开 Flink REST API 的启动、路由注册、请求解析、leader gateway 调用和响应返回流程。"
+---
+
+很多人第一次看 Flink REST API 的源码时，会有一个很自然的疑问：
+
+> 为什么写一个 `CheckpointConfigHandler`，再写一个 `CheckpointConfigHeaders`，这个接口就能被 HTTP 访问了？
+
+如果你习惯了 Spring MVC，很容易下意识去找：
+
+```java
+@RestController
+@GetMapping("/xxx")
+```
+
+但 Flink 不是这个路子。Flink Runtime 里的 REST API 更偏底层，它直接基于 **Netty + Router + 一组 ChannelInboundHandler** 做请求分发。它的核心不是 Controller 注解，而是：
+
+```text
+MessageHeaders 描述接口元信息
+AbstractRestHandler 处理请求逻辑
+RestServerEndpoint 启动 Netty 并注册 handler
+GatewayRetriever 找到当前 leader gateway
+RestfulGateway / DispatcherGateway 执行真正的集群操作
+```
+
+官方文档里说 Flink 提供了一个 monitoring API，用来查询运行中作业和历史作业的状态、统计信息，这个 API 同时被 Flink Dashboard 使用，也可以给外部监控工具使用。它接受 HTTP 请求，并返回 JSON。理解源码时，可以把 Flink REST API 看成 JobManager / Dispatcher 暴露给 Dashboard、CLI 和外部系统的一层 HTTP 门面。
+
+## 一句话总览
+
+Flink 的 REST API 实现可以压缩成一句话：
+
+> JobManager 启动时创建 `DispatcherRestEndpoint`，它继承 `WebMonitorEndpoint`，最终由 `RestServerEndpoint.start()` 启动一个 Netty HTTP Server；启动过程中调用 `initializeHandlers()` 创建所有 REST Handler，然后根据每个 Handler 对应的 `MessageHeaders` 把 URL、HTTP Method 和 Netty Handler 注册到 Router；请求进来后，Netty pipeline 解码 HTTP 请求，Router 找到对应 Handler，Handler 解析 request body / path parameter / query parameter，再通过 leader gateway 查询或修改 Flink 集群状态，最后把 `ResponseBody` 序列化成 JSON 写回客户端。
+
+画成图大概是这样：
+
+```text
+                   HTTP Request
+                        |
+                        v
++---------------------------------------------------+
+|                 Netty Server                       |
+|                                                   |
+|  HttpServerCodec                                  |
+|       -> FileUploadHandler                        |
+|       -> FlinkHttpObjectAggregator                |
+|       -> ChunkedWriteHandler                      |
+|       -> RouterHandler                            |
+|       -> PipelineErrorHandler                     |
++---------------------------------------------------+
+                        |
+                        v
+                 Router 匹配路由
+                        |
+                        v
+              AbstractRestHandler 子类
+                        |
+                        v
+              GatewayRetriever 获取 leader
+                        |
+                        v
+             DispatcherGateway / RestfulGateway
+                        |
+                        v
+               Flink Runtime 内部状态
+                        |
+                        v
+                  ResponseBody(JSON)
+```
+
+这篇文章按源码链路拆：先看启动注册，再看请求处理，最后用 checkpoint config 接口举一个完整例子。
+
+## 1. 先把几个核心类摆清楚
+
+Flink REST API 这块源码主要分散在几个包里：
+
+```text
+org.apache.flink.runtime.rest
+org.apache.flink.runtime.rest.handler
+org.apache.flink.runtime.rest.messages
+org.apache.flink.runtime.webmonitor
+org.apache.flink.runtime.dispatcher
+```
+
+最关键的是下面这些类。
+
+### 1.1 `RestServerEndpoint`：真正启动 Netty HTTP Server 的地方
+
+`RestServerEndpoint` 是 REST 服务端的抽象基类。它不关心具体有哪些 API，它负责的是服务端生命周期：
+
+```text
+读取 REST 配置
+创建 upload 目录
+加载额外 inbound channel handler
+初始化所有 REST handler
+注册路由
+构建 Netty pipeline
+绑定端口
+关闭服务
+```
+
+也就是说，Flink 的 REST Server 不是由某个 Web 框架托管的，而是自己在 runtime 层面启动了一个 Netty server。
+
+`RestServerEndpoint` 里最关键的方法是：
+
+```java
+public final void start() throws Exception
+```
+
+它里面会做几件事：
+
+```text
+1. new Router()
+2. initializeHandlers(restAddressFuture)
+3. 按 URL 排序 handlers
+4. 检查 endpoint + handler 是否重复
+5. registerHandler(router, handler)
+6. 创建 Netty ChannelInitializer
+7. 设置 pipeline
+8. 创建 ServerBootstrap
+9. 绑定端口
+10. 完成 restAddressFuture
+11. 调用 startInternal()
+```
+
+这里有一个设计点很重要：
+
+```java
+protected abstract List<Tuple2<RestHandlerSpecification, ChannelInboundHandler>>
+    initializeHandlers(CompletableFuture<String> localAddressFuture);
+```
+
+`RestServerEndpoint` 只定义了“启动流程”，但是不定义“有哪些接口”。具体有哪些 REST API，是子类通过 `initializeHandlers()` 返回的。
+
+这就是典型的模板方法思路：
+
+```text
+RestServerEndpoint.start() 固定启动流程
+        |
+        v
+子类实现 initializeHandlers() 决定注册哪些 API
+```
+
+### 1.2 `WebMonitorEndpoint`：把 Flink Dashboard / Job 相关 API 组织起来
+
+`WebMonitorEndpoint<T extends RestfulGateway>` 继承自 `RestServerEndpoint`。
+
+它是 Flink Web UI 和大部分 JobManager REST API 的集中注册点。比如：
+
+```text
+/jobs
+/jobs/overview
+/jobs/:jobid
+/jobs/:jobid/config
+/jobs/:jobid/checkpoints/config
+/taskmanagers
+/jobmanager/config
+/jobmanager/logs
+/overview
+/config
+```
+
+这些 API 对应的 handler，大多都在 `WebMonitorEndpoint.initializeHandlers()` 里创建，然后塞进 `handlers` 列表。
+
+你可以把 `WebMonitorEndpoint` 理解为：
+
+```text
+RestServerEndpoint 负责搭 HTTP Server
+WebMonitorEndpoint 负责声明“Flink 需要暴露哪些监控类 API”
+```
+
+### 1.3 `DispatcherRestEndpoint`：Dispatcher 这一侧的 REST Endpoint
+
+`DispatcherRestEndpoint` 继承自：
+
+```java
+WebMonitorEndpoint<DispatcherGateway>
+```
+
+这说明它面向的 leader gateway 类型是 `DispatcherGateway`。
+
+在 Flink 里，Dispatcher 负责接收作业提交、管理 JobMaster 生命周期、查询作业信息等。很多 REST 请求最后都不是 handler 自己完成的，而是转发成对 `DispatcherGateway` 或相关 runtime gateway 的异步调用。
+
+所以关系大致是：
+
+```text
+DispatcherRestEndpoint
+        extends WebMonitorEndpoint<DispatcherGateway>
+                extends RestServerEndpoint
+```
+
+也就是说：
+
+```text
+RestServerEndpoint：怎么启动 REST Server
+WebMonitorEndpoint：有哪些 Web / Job / Cluster API
+DispatcherRestEndpoint：这些 API 连接到 DispatcherGateway
+```
+
+### 1.4 `MessageHeaders`：一个 REST API 的“接口元信息”
+
+Flink 不是用注解声明 REST API，而是用 `MessageHeaders` 系列类描述 API。
+
+一个 `MessageHeaders` 通常会说明：
+
+```text
+请求 body 类型是什么
+响应 body 类型是什么
+path/query 参数是什么
+HTTP method 是什么
+URL 是什么
+响应 HTTP status 是什么
+API 描述是什么
+支持哪些 REST API version
+```
+
+例如 checkpoint config 接口的 headers 是：
+
+```java
+CheckpointConfigHeaders
+```
+
+它定义的核心信息是：
+
+```text
+URL: /jobs/:jobid/checkpoints/config
+Method: GET
+RequestBody: EmptyRequestBody
+ResponseBody: CheckpointConfigInfo
+Parameters: JobMessageParameters
+Status: 200 OK
+Description: Returns the checkpointing configuration.
+```
+
+这个类的价值不只是注册路由，它还让请求解析、响应序列化、API 文档生成、版本管理都有统一入口。
+
+### 1.5 `AbstractRestHandler`：真正处理业务逻辑的基类
+
+`AbstractRestHandler` 是大部分 JSON REST API handler 的基类。
+
+它的泛型很长，但含义很清楚：
+
+```java
+AbstractRestHandler<
+    T extends RestfulGateway,
+    R extends RequestBody,
+    P extends ResponseBody,
+    M extends MessageParameters
+>
+```
+
+分别表示：
+
+```text
+T: 当前 leader gateway 类型
+R: 请求 body 类型
+P: 响应 body 类型
+M: path/query 参数类型
+```
+
+它最关键的方法是：
+
+```java
+protected abstract CompletableFuture<P> handleRequest(
+    HandlerRequest<R> request,
+    T gateway
+) throws RestHandlerException;
+```
+
+也就是说，子类只需要实现“拿到解析后的请求和 leader gateway 后，怎么构造响应”。至于 HTTP 解码、JSON 反序列化、参数解析、异常转 HTTP status、响应写回 Netty，这些都由父类处理。
+
+## 2. REST API 是什么时候注册进去的？
+
+入口在 `RestServerEndpoint.start()`。
+
+它做的第一件关键事情是：
+
+```text
+创建 Router
+调用 initializeHandlers()
+把每个 handler 注册到 Router
+启动 Netty Server
+```
+
+可以把启动注册流程画成这样：
+
+```text
+JobManager / Dispatcher 启动
+        |
+        v
+创建 DispatcherRestEndpoint
+        |
+        v
+调用 RestServerEndpoint.start()
+        |
+        v
+new Router()
+        |
+        v
+WebMonitorEndpoint.initializeHandlers()
+        |
+        v
+创建各种 Handler：
+  ClusterOverviewHandler
+  JobIdsHandler
+  JobStatusHandler
+  CheckpointConfigHandler
+  CheckpointingStatisticsHandler
+  JobPlanHandler
+  TaskManagersHandler
+  ...
+        |
+        v
+registerHandler(router, headers + handler)
+        |
+        v
+Netty bind port
+```
+
+这里有个容易忽略的点：`initializeHandlers()` 返回的不是单独的 handler，而是：
+
+```java
+Tuple2<RestHandlerSpecification, ChannelInboundHandler>
+```
+
+也就是：
+
+```text
+RestHandlerSpecification：接口规格，主要来自 MessageHeaders
+ChannelInboundHandler：真正处理这个接口的 Netty handler
+```
+
+为什么要把这两个绑在一起？因为注册路由时既需要知道：
+
+```text
+URL 是什么？
+GET 还是 POST？
+支持哪个 API version？
+```
+
+也需要知道：
+
+```text
+请求命中后交给哪个 handler 处理？
+```
+
+所以最终注册进 Router 的不是一个普通函数，而是：
+
+```text
+HTTP Method + URL -> ChannelInboundHandler
+```
+
+## 3. 为什么注册前要对 URL 排序？
+
+`RestServerEndpoint.start()` 里有一步：
+
+```java
+Collections.sort(handlers, RestHandlerUrlComparator.INSTANCE);
+```
+
+这个排序非常关键。
+
+假设有两个路由：
+
+```text
+/jobs/overview
+/jobs/:jobid
+```
+
+如果 `/jobs/:jobid` 先注册，那么请求 `/jobs/overview` 可能会被当成：
+
+```text
+jobid = overview
+```
+
+这就错了。
+
+所以 Flink 会让更具体的 URL 排在前面，让带 path parameter 的 URL 排在后面。源码注释里举的顺序大概是：
+
+```text
+/jobs
+/jobs/overview
+/jobs/:jobid
+/jobs/:jobid/config
+/:*
+```
+
+这也是为什么 Flink 自己实现 Router 注册时，需要关心路径匹配顺序。Spring 之类的框架通常帮你处理了这些细节，但 Flink 这里是 runtime 层自己维护。
+
+## 4. URL 版本是怎么处理的？
+
+Flink REST API 支持 versioned URL，也支持默认版本的 unversioned URL。
+
+一个 handler 的 `RestHandlerSpecification` 会暴露：
+
+```text
+getSupportedAPIVersions()
+getTargetRestEndpointURL()
+```
+
+注册路由时，Flink 会对每个 supported version 拼出：
+
+```text
+/<version-prefix><target-url>
+```
+
+如果某个 version 是 default version，还会额外注册一个不带版本前缀的 URL，用于兼容和方便访问。
+
+所以一个逻辑 API 可能同时对应：
+
+```text
+/v1/jobs/:jobid/checkpoints/config
+/jobs/:jobid/checkpoints/config
+```
+
+这就是为什么你看到文档里可以直接访问 `/jobs/...`，但源码里又有 REST API version 的抽象。
+
+## 5. Netty pipeline 长什么样？
+
+`RestServerEndpoint.start()` 会构建一个 `ChannelInitializer<SocketChannel>`，然后在每个连接建立时设置 pipeline。
+
+核心顺序大概是：
+
+```text
+RedirectingSslHandler       可选，HTTPS 场景
+HttpServerCodec             HTTP 编解码
+FileUploadHandler           文件上传处理，比如 jar 上传
+FlinkHttpObjectAggregator   聚合 FullHttpRequest
+额外 InboundChannelHandler   通过 ServiceLoader 加载
+ChunkedWriteHandler         支持 chunked 写出
+RouterHandler               路由分发
+PipelineErrorHandler        pipeline 兜底异常处理
+```
+
+这里能看出 Flink REST API 的几个特征。
+
+第一，它直接使用 Netty，所以 handler 本质是 `ChannelInboundHandler`。
+
+第二，它支持文件上传。比如 Web UI 提交 jar、上传 artifact 这类接口，就不是简单 JSON body。
+
+第三，它允许通过 `InboundChannelHandlerFactory` 加载额外的 inbound handler。这给安全、审计、网关增强之类的场景留了扩展点。
+
+第四，真正的 API 分发是在 `RouterHandler` 里发生的。前面的 codec、upload、aggregator 都是在把原始网络数据整理成 handler 能处理的 HTTP 请求对象。
+
+## 6. 一个请求进来以后发生了什么？
+
+以请求：
+
+```http
+GET /jobs/:jobid/checkpoints/config
+```
+
+为例，完整链路大概是：
+
+```text
+1. 客户端发 HTTP 请求
+2. Netty 接收连接
+3. HttpServerCodec 解码 HTTP
+4. FileUploadHandler 处理上传文件，如果有的话
+5. FlinkHttpObjectAggregator 聚合成 FullHttpRequest
+6. RouterHandler 根据 method + path 匹配 handler
+7. 命中 CheckpointConfigHandler
+8. LeaderRetrievalHandler 获取当前 leader gateway
+9. AbstractHandler 解析 request body / path params / query params
+10. AbstractRestHandler 调用子类 handleRequest()
+11. Handler 查询 ExecutionGraph 或调用 DispatcherGateway
+12. 构造 ResponseBody
+13. HandlerUtils.sendResponse() 序列化成 JSON
+14. Netty 写回 HTTP response
+```
+
+把 handler 内部再放大一点，是这样：
+
+```text
+RoutedRequest
+    |
+    v
+LeaderRetrievalHandler.channelRead0()
+    |
+    |-- leaderRetriever.getNow()
+    |       |
+    |       |-- 有 leader：respondAsLeader(..., gateway)
+    |       |
+    |       |-- 无 leader：返回 503，提示正在 leader election
+    v
+AbstractHandler.respondAsLeader()
+    |
+    |-- 检查是否 FullHttpRequest
+    |-- 读取 request body
+    |-- Jackson 反序列化 RequestBody
+    |-- 解析 path params / query params
+    |-- 创建 HandlerRequest<R>
+    v
+AbstractRestHandler.respondToRequest()
+    |
+    |-- handleRequest(handlerRequest, gateway)
+    |-- sendResponse(responseBody, statusCode)
+```
+
+这里最重要的是：REST handler 并不直接从 URL 字符串里手动取参数，也不自己读 JSON body。父类会统一做这些事情，最后给子类一个已经解析好的 `HandlerRequest<R>`。
+
+## 7. `HandlerRequest` 解决了什么问题？
+
+HTTP 请求里有三类输入：
+
+```text
+request body
+path parameter
+query parameter
+```
+
+比如：
+
+```http
+GET /jobs/8f8a.../checkpoints/config?foo=bar
+```
+
+里面至少有：
+
+```text
+path parameter: jobid = 8f8a...
+query parameter: foo = bar
+body: GET 一般是 EmptyRequestBody
+```
+
+Flink 用 `MessageParameters` 描述一个接口需要哪些 path/query 参数。`AbstractHandler` 收到请求后，会调用类似这样的流程：
+
+```text
+HandlerRequest.resolveParametersAndCreate(
+    requestBody,
+    unresolvedMessageParameters,
+    pathParams,
+    queryParams,
+    uploadedFiles
+)
+```
+
+最后子类拿到的就是一个类型化的 `HandlerRequest<R>`。
+
+这样做的好处是：
+
+```text
+参数解析集中管理
+错误请求统一返回 400
+handler 逻辑更干净
+API schema 和 runtime 行为一致
+```
+
+例如 handler 里想拿 job id，通常不是自己 parse URL，而是从 path parameter 对象里拿：
+
+```java
+request.getPathParameter(JobIDPathParameter.class)
+```
+
+## 8. 为什么要有 `GatewayRetriever`？
+
+Flink 是分布式系统，JobManager / Dispatcher 存在 leader 选举。
+
+REST 请求打到某个进程时，handler 不能假设“当前进程一定已经有可用 leader”。所以 Flink 在 handler 前面抽了一层：
+
+```java
+LeaderRetrievalHandler<T extends RestfulGateway>
+```
+
+它做的事情是：
+
+```text
+1. 从 GatewayRetriever 里取当前 leader gateway
+2. 如果拿到了，调用 respondAsLeader(..., gateway)
+3. 如果没拿到，返回 503 Service Unavailable
+```
+
+所以 REST API 的业务处理一般都有一个 gateway 参数：
+
+```java
+handleRequest(HandlerRequest<R> request, T gateway)
+```
+
+这个 gateway 代表当前 leader 暴露出来的 RPC 能力。
+
+例如：
+
+```text
+DispatcherRestEndpoint 使用 DispatcherGateway
+ResourceManager 相关接口可能要通过 ResourceManagerGateway
+Job 详情类接口可能查询 ExecutionGraphCache
+Metric 接口可能使用 MetricFetcher
+```
+
+这个设计把 HTTP 层和 Flink 内部 RPC 层隔开了：
+
+```text
+HTTP 请求
+  -> REST Handler
+      -> Gateway 接口
+          -> Runtime 组件
+```
+
+REST handler 不应该直接操作底层对象，而是尽量通过 gateway/cache/fetcher 这些抽象拿数据。
+
+## 9. 以 CheckpointConfigHandler 为例看完整实现
+
+现在回到你前面看到的 checkpoint 相关代码。
+
+这个接口的功能是：
+
+```text
+查询某个 Job 的 checkpoint 配置
+```
+
+对应 URL 是：
+
+```text
+GET /jobs/:jobid/checkpoints/config
+```
+
+### 9.1 `CheckpointConfigHeaders` 描述接口
+
+`CheckpointConfigHeaders` 大概表达了这些信息：
+
+```text
+URL: /jobs/:jobid/checkpoints/config
+HTTP Method: GET
+RequestBody: EmptyRequestBody
+ResponseBody: CheckpointConfigInfo
+MessageParameters: JobMessageParameters
+StatusCode: 200 OK
+Description: Returns the checkpointing configuration.
+```
+
+也就是说，headers 不是 HTTP 请求头的意思，而是 Flink REST API 里的“接口定义对象”。它告诉 REST 框架：这个 API 怎么注册、怎么解析、怎么响应。
+
+### 9.2 `CheckpointConfigHandler` 处理业务
+
+`CheckpointConfigHandler` 继承的是：
+
+```java
+AbstractAccessExecutionGraphHandler<CheckpointConfigInfo, JobMessageParameters>
+```
+
+它没有直接继承 `AbstractRestHandler`，而是走了一个更具体的 job graph handler 基类。
+
+这说明 checkpoint config 这类接口需要访问 `AccessExecutionGraph`。
+
+它的核心逻辑可以简化成：
+
+```java
+protected CheckpointConfigInfo handleRequest(
+    HandlerRequest<EmptyRequestBody> request,
+    AccessExecutionGraph executionGraph
+) throws RestHandlerException {
+    return createCheckpointConfigInfo(executionGraph);
+}
+```
+
+再往里看，`createCheckpointConfigInfo(executionGraph)` 会从 `AccessExecutionGraph` 里取：
+
+```text
+CheckpointCoordinatorConfiguration
+state backend name
+checkpoint storage name
+changelog storage name
+execution config
+```
+
+然后组装成 `CheckpointConfigInfo` 返回。
+
+如果这个 job 没有开启 checkpoint，`executionGraph.getCheckpointCoordinatorConfiguration()` 为空，它会抛出 `RestHandlerException`，HTTP status 是 `404 NOT_FOUND`。
+
+这就解释了一个现象：
+
+```text
+同一个 REST handler 既可能返回 200 + CheckpointConfigInfo，
+也可能因为业务状态不满足返回 404 + ErrorResponseBody。
+```
+
+错误码不是 Netty 自动决定的，而是 handler 抛出的 `RestHandlerException` 带出来的。
+
+### 9.3 这个接口是怎么被注册的？
+
+在 `WebMonitorEndpoint.initializeHandlers()` 里，会创建：
+
+```java
+CheckpointConfigHandler checkpointConfigHandler =
+    new CheckpointConfigHandler(
+        leaderRetriever,
+        timeout,
+        responseHeaders,
+        CheckpointConfigHeaders.getInstance(),
+        executionGraphCache,
+        executor
+    );
+```
+
+然后它会被加入 handlers 列表，最终由 `RestServerEndpoint.start()` 注册到 Router。
+
+最终关系是：
+
+```text
+CheckpointConfigHeaders
+        |
+        | 定义 URL / Method / Request / Response / Parameters
+        v
+CheckpointConfigHandler
+        |
+        | 实现查询 checkpoint config 的业务逻辑
+        v
+WebMonitorEndpoint.initializeHandlers()
+        |
+        | 创建 handler 并加入列表
+        v
+RestServerEndpoint.start()
+        |
+        | 注册到 Router 并启动 Netty
+        v
+GET /jobs/:jobid/checkpoints/config 可访问
+```
+
+## 10. Handler 的返回为什么是 `CompletableFuture`？
+
+Flink Runtime 内部大量操作是异步的。
+
+比如：
+
+```text
+查询 DispatcherGateway
+查询 ResourceManagerGateway
+等待 job result
+触发 savepoint
+停止 job
+异步 operation 状态查询
+```
+
+这些操作不应该阻塞 Netty event loop。
+
+所以很多 handler 的核心方法返回：
+
+```java
+CompletableFuture<P>
+```
+
+这样 handler 可以发起异步 RPC，等 future 完成后再写 HTTP response。
+
+这也是为什么 `AbstractRestHandler.respondToRequest()` 的逻辑是：
+
+```text
+handleRequest(...) 返回 CompletableFuture<ResponseBody>
+        |
+        v
+thenCompose(resp -> sendResponse(...))
+```
+
+如果业务异常通过 `RestHandlerException` 抛出，父类会把它转成对应 HTTP status；如果是非预期异常，通常会落到 500。
+
+## 11. Flink REST API 的错误处理链路
+
+错误大致分三类。
+
+### 11.1 请求格式错误
+
+比如 JSON body 不符合 request class，path/query parameter 解析失败，或者接口不允许文件上传但请求带了文件。
+
+这类错误通常在 `AbstractHandler.respondAsLeader()` 阶段就会被拦住，然后返回：
+
+```text
+400 Bad Request
+```
+
+### 11.2 leader 不可用
+
+如果当前没有 leader gateway，比如正在 leader election，`LeaderRetrievalHandler` 会返回：
+
+```text
+503 Service Unavailable
+```
+
+这个错误不是业务 handler 抛出来的，而是在进入业务 handler 前就被 leader retrieval 层拦住了。
+
+### 11.3 业务状态错误
+
+比如 checkpoint 没开启、job 不存在、savepoint trigger 失败等。
+
+这类错误一般由具体 handler 抛出：
+
+```java
+new RestHandlerException(message, HttpResponseStatus.NOT_FOUND)
+```
+
+最后父类统一转成：
+
+```text
+指定 HTTP status + ErrorResponseBody
+```
+
+这个设计的好处是：
+
+```text
+handler 只表达业务错误是什么
+HTTP 层统一负责格式化错误响应
+```
+
+## 12. 异步操作类 API 是怎么做的？
+
+Flink 里有些 REST API 不是“一次请求立即返回最终结果”。比如：
+
+```text
+触发 savepoint
+停止作业并生成 savepoint
+异步 rescale
+异步 profiling
+```
+
+这类 API 一般会设计成两段式：
+
+```text
+POST /xxx
+    -> 返回 trigger id / request id
+
+GET /xxx/:triggerid
+    -> 查询异步操作状态
+```
+
+内部通常会有类似 async operation store 的结构，把触发后的 operation future 存起来，后续通过 trigger id 查询。
+
+这也是为什么 `WebMonitorEndpoint.initializeHandlers()` 里会读取：
+
+```text
+RestOptions.ASYNC_OPERATION_STORE_DURATION
+```
+
+它决定异步操作状态在 REST 层保留多久。
+
+这套设计避免了 HTTP 请求长时间挂住，也适合 savepoint 这种耗时操作。
+
+## 13. 文件上传类 API 是怎么支持的？
+
+Flink REST 不只有 JSON 请求，还支持文件上传。
+
+典型场景是：
+
+```text
+上传 jar
+提交 jar
+上传 artifacts
+```
+
+`RestServerEndpoint` 在 pipeline 里放了：
+
+```text
+FileUploadHandler
+FlinkHttpObjectAggregator
+```
+
+同时在注册 handler 时，会根据 `UntypedResponseMessageHeaders.acceptsFileUploads()` 判断哪些 route 允许上传文件。
+
+如果某个接口不允许文件上传，但请求带了上传文件，`AbstractHandler` 会直接返回 bad request。
+
+这说明文件上传不是散落在业务 handler 里处理的，而是在 REST 框架层统一接入。业务 handler 拿到的是已经解析好的 uploaded files。
+
+## 14. 如果要新增一个 Flink REST API，要改哪些东西？
+
+如果你在 Flink 内核里新增 REST API，大体需要四步。
+
+### 14.1 定义 request / response body
+
+如果接口有请求 body，需要定义：
+
+```java
+class XxxRequestBody implements RequestBody
+```
+
+如果没有请求 body，用：
+
+```java
+EmptyRequestBody
+```
+
+响应需要定义：
+
+```java
+class XxxResponseBody implements ResponseBody
+```
+
+注意这些类通常要配合 Jackson 序列化，字段命名、构造方法、注解都要符合 Flink REST message 的约定。
+
+### 14.2 定义 path/query parameters
+
+如果 URL 里有 path parameter，或者 query string 里有参数，需要定义或复用 `MessageParameters`。
+
+比如 job 级接口常用：
+
+```java
+JobMessageParameters
+```
+
+它里面包含 job id 这类 path parameter。
+
+### 14.3 定义 headers
+
+新增一个：
+
+```java
+XxxHeaders implements RuntimeMessageHeaders<Req, Resp, Params>
+```
+
+里面至少要定义：
+
+```text
+getRequestClass()
+getResponseClass()
+getResponseStatusCode()
+getUnresolvedMessageParameters()
+getHttpMethod()
+getTargetRestEndpointURL()
+getDescription()
+```
+
+这一步相当于声明 API schema。
+
+### 14.4 定义 handler
+
+新增一个 handler，比如：
+
+```java
+XxxHandler extends AbstractRestHandler<Gateway, Req, Resp, Params>
+```
+
+然后实现：
+
+```java
+protected CompletableFuture<Resp> handleRequest(
+    HandlerRequest<Req> request,
+    Gateway gateway
+)
+```
+
+如果是 job execution graph 相关接口，也可能继承更具体的基类，比如：
+
+```java
+AbstractAccessExecutionGraphHandler
+```
+
+这样可以复用 job id 解析、execution graph 获取、archive json 等能力。
+
+### 14.5 注册到 Endpoint
+
+最后在合适的 endpoint 里注册。大多数 Web / JobManager 相关接口是在：
+
+```java
+WebMonitorEndpoint.initializeHandlers()
+```
+
+如果是 Dispatcher 特有的 web submission handler，则可能在：
+
+```java
+DispatcherRestEndpoint.initializeWebSubmissionHandlers()
+```
+
+注册时要把：
+
+```text
+XxxHeaders.getInstance()
+XxxHandler 实例
+```
+
+一起加入 handler 列表。只写 handler 不注册，HTTP 请求是打不到它的。
+
+## 15. 为什么 Flink 要这么设计？
+
+这套设计看起来比注解式 Web 框架麻烦，但它适合 Flink Runtime 的场景。
+
+### 15.1 Runtime 不想依赖重量级 Web 框架
+
+Flink JobManager 本身就是一个复杂 runtime 进程。REST API 是 runtime 的管理入口，而不是业务 Web 服务。
+
+直接用 Netty 可以更细粒度控制：
+
+```text
+端口绑定
+SSL
+pipeline
+文件上传
+请求大小限制
+异步响应
+关闭生命周期
+额外 channel handler
+```
+
+这些东西在 Flink 这种系统里都很重要。
+
+### 15.2 API schema 和 handler 解耦
+
+`MessageHeaders` 把 API 元信息独立出来：
+
+```text
+URL
+Method
+Request type
+Response type
+Parameter type
+Status code
+Description
+Version
+```
+
+handler 只负责业务逻辑。
+
+这让 Flink 可以更容易地生成 REST 文档、做版本管理、做类型化请求解析。
+
+### 15.3 适配 leader election
+
+Flink 的 REST API 背后不是单机 controller，而是 leader gateway。
+
+所以每个请求都要考虑：
+
+```text
+当前有没有 leader？
+leader gateway 是哪个？
+请求是不是应该转给当前 leader？
+leader 切换期间怎么响应？
+```
+
+`LeaderRetrievalHandler + GatewayRetriever` 正是为这个问题服务的。
+
+### 15.4 适配异步 runtime 操作
+
+Flink 的很多操作天然异步，比如 savepoint、job cancellation、rescale、profiling。用 `CompletableFuture` 串起来，比阻塞式 servlet 模型更贴近 runtime 内部的异步 RPC 风格。
+
+## 16. 用一句话理解每一层
+
+最后把每一层压缩一下：
+
+```text
+RestServerEndpoint
+    管 Netty server 生命周期和路由注册。
+
+WebMonitorEndpoint
+    管 Flink Web UI / JobManager 监控类 API 的 handler 列表。
+
+DispatcherRestEndpoint
+    把这些 REST API 接到 DispatcherGateway。
+
+MessageHeaders
+    描述一个 REST API 的 URL、Method、请求类型、响应类型和参数类型。
+
+AbstractHandler
+    负责 HTTP body 解析、参数解析、文件上传校验、异常处理。
+
+AbstractRestHandler
+    负责把业务返回的 ResponseBody 写回 HTTP response。
+
+LeaderRetrievalHandler
+    负责在请求处理前拿到当前 leader gateway，拿不到就返回 503。
+
+具体 Handler
+    只关心业务：从 request / gateway / execution graph / metric fetcher 中拿数据，构造 response。
+```
+
+## 17. 总结
+
+Flink REST API 的实现不是“一个 URL 对应一个 Controller 方法”，而是更底层的一套 runtime HTTP 框架。
+
+它的主线是：
+
+```text
+启动时：
+DispatcherRestEndpoint
+  -> WebMonitorEndpoint.initializeHandlers()
+  -> RestServerEndpoint.start()
+  -> Router 注册 Method + URL + Handler
+  -> Netty Server bind port
+
+请求时：
+HTTP Request
+  -> Netty pipeline
+  -> RouterHandler
+  -> LeaderRetrievalHandler
+  -> AbstractHandler 解析请求
+  -> AbstractRestHandler 调用 handleRequest
+  -> Gateway / ExecutionGraph / MetricFetcher
+  -> ResponseBody
+  -> JSON HTTP Response
+```
+
+所以如果你要读 Flink REST API 源码，不要从“接口文档”开始一条条找，而应该先抓住这四个核心点：
+
+```text
+1. RestServerEndpoint 怎么启动和注册路由
+2. WebMonitorEndpoint 怎么创建 handler 列表
+3. MessageHeaders 怎么描述 API schema
+4. AbstractRestHandler 怎么处理请求并返回响应
+```
+
+抓住这条线以后，再看具体接口，比如 checkpoint、savepoint、job config、metrics、taskmanager logs，就会清楚很多：它们不是各写各的 HTTP 服务，而是都挂在同一套 REST runtime 框架上。
+
+## 参考源码
+
+- `org.apache.flink.runtime.rest.RestServerEndpoint`
+- `org.apache.flink.runtime.webmonitor.WebMonitorEndpoint`
+- `org.apache.flink.runtime.dispatcher.DispatcherRestEndpoint`
+- `org.apache.flink.runtime.rest.handler.AbstractHandler`
+- `org.apache.flink.runtime.rest.handler.AbstractRestHandler`
+- `org.apache.flink.runtime.rest.handler.LeaderRetrievalHandler`
+- `org.apache.flink.runtime.rest.messages.MessageHeaders`
+- `org.apache.flink.runtime.rest.messages.checkpoints.CheckpointConfigHeaders`
+- `org.apache.flink.runtime.rest.handler.job.checkpoints.CheckpointConfigHandler`
