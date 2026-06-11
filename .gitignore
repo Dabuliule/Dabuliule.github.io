@@ -24,3 +24,6 @@ yarn-error.log*
 .env*.local
 .vercel
 next-env.d.ts
+
+# local drafts
+content/docs/flink-dynamic-checkpoint-config.mdx
