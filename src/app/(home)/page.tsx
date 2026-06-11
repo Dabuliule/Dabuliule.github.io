@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { source } from '@/lib/source';
-import { ArrowUpRight, BookOpen, CalendarDays, FileText, Tags } from 'lucide-react';
+import { ArrowUpRight, CalendarDays, FileText, Tags, UserRound } from 'lucide-react';
 
 type Page = (typeof source)['$inferPage'];
 
@@ -17,6 +17,13 @@ function formatDate(date?: string) {
   if (Number.isNaN(value.getTime())) return date;
 
   return dateFormatter.format(value);
+}
+
+function getPageTime(page: Page) {
+  if (!page.data.date) return 0;
+
+  const time = new Date(page.data.date).getTime();
+  return Number.isNaN(time) ? 0 : time;
 }
 
 function ArticleCard({ page, featured = false }: { page: Page; featured?: boolean }) {
@@ -60,66 +67,107 @@ export default function HomePage() {
   const pages = source
     .getPages()
     .filter((page) => page.url !== '/docs')
-    .sort((a, b) => {
-      const aTime = a.data.date ? new Date(a.data.date).getTime() : 0;
-      const bTime = b.data.date ? new Date(b.data.date).getTime() : 0;
+    .sort((a, b) => getPageTime(b) - getPageTime(a));
+  const tagGroups = Array.from(
+    pages.reduce((groups, page) => {
+      const tag = page.data.tag;
+      if (!tag) return groups;
 
-      return bTime - aTime;
-    });
-  const tags = Array.from(new Set(pages.map((page) => page.data.tag).filter(Boolean)));
+      const group = groups.get(tag) ?? [];
+      group.push(page);
+      groups.set(tag, group);
+
+      return groups;
+    }, new Map<string, Page[]>()),
+  ).map(([tag, groupPages]) => ({ tag, pages: groupPages }));
   const latestPage = pages[0];
 
   return (
     <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col px-6 py-12 sm:py-16">
-      <div className="grid gap-10 border-b pb-10 lg:grid-cols-[1.1fr_0.9fr] lg:items-end">
-        <section>
-          <div className="mb-5 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium text-fd-muted-foreground">
-            <BookOpen className="size-3.5" aria-hidden="true" />
-            个人技术博客
-          </div>
-          <h1 className="max-w-2xl text-4xl font-semibold leading-tight tracking-normal sm:text-5xl">
-            写一些终于想明白的东西
-          </h1>
-          <p className="mt-5 max-w-2xl text-base leading-7 text-fd-muted-foreground">
-            记录写代码、做项目、读系统时遇到的问题：
-            踩过的坑，拆开的概念，以及某一刻突然想通的想法。
-          </p>
-        </section>
-
-        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1">
-          <div className="rounded-lg border bg-fd-card p-4">
-            <div className="flex items-center gap-2 text-sm text-fd-muted-foreground">
-              <FileText className="size-4" aria-hidden="true" />
-              文章
-            </div>
-            <div className="mt-2 text-2xl font-semibold">{pages.length}</div>
-          </div>
-          <div className="rounded-lg border bg-fd-card p-4">
-            <div className="flex items-center gap-2 text-sm text-fd-muted-foreground">
-              <Tags className="size-4" aria-hidden="true" />
-              Tag
-            </div>
-            <div className="mt-2 flex flex-wrap gap-2">
-              {tags.map((tag) => (
-                <span key={tag} className="rounded-md bg-fd-muted px-2 py-1 text-xs font-medium">
-                  {tag}
-                </span>
-              ))}
-            </div>
-          </div>
-        </section>
+      <div className="mb-4 flex justify-end">
+        <Link
+          href="/docs"
+          className="inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm font-medium text-fd-muted-foreground transition-colors hover:bg-fd-accent hover:text-fd-foreground"
+        >
+          <UserRound className="size-4" aria-hidden="true" />
+          关于我
+        </Link>
       </div>
+
+      <section className="grid gap-3 border-b pb-8 sm:grid-cols-2">
+        <div className="rounded-lg border bg-fd-card p-4">
+          <div className="flex items-center gap-2 text-sm text-fd-muted-foreground">
+            <FileText className="size-4" aria-hidden="true" />
+            文章
+          </div>
+          <div className="mt-2 text-2xl font-semibold">{pages.length}</div>
+        </div>
+        <div className="rounded-lg border bg-fd-card p-4">
+          <div className="flex items-center gap-2 text-sm text-fd-muted-foreground">
+            <Tags className="size-4" aria-hidden="true" />
+            Tag
+          </div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {tagGroups.map((group) => (
+              <span
+                key={group.tag}
+                className="rounded-md bg-fd-muted px-2 py-1 text-xs font-medium"
+              >
+                {group.tag} · {group.pages.length}
+              </span>
+            ))}
+          </div>
+        </div>
+      </section>
 
       {latestPage ? (
         <section className="grid gap-4 border-b py-8 md:grid-cols-[180px_1fr]">
           <div>
             <h2 className="text-sm font-semibold uppercase tracking-normal text-fd-muted-foreground">
-              最新
+              最新文章
             </h2>
           </div>
           <ArticleCard page={latestPage} featured />
         </section>
       ) : null}
+
+      <section className="grid gap-4 border-b py-8 md:grid-cols-[180px_1fr]">
+        <div>
+          <h2 className="text-sm font-semibold uppercase tracking-normal text-fd-muted-foreground">
+            分类浏览
+          </h2>
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          {tagGroups.map((group) => (
+            <section key={group.tag} className="rounded-lg border bg-fd-card p-4">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <h3 className="font-semibold">{group.tag}</h3>
+                <span className="rounded-md bg-fd-muted px-2 py-1 text-xs font-medium text-fd-muted-foreground">
+                  {group.pages.length} 篇
+                </span>
+              </div>
+              <div className="grid gap-2">
+                {group.pages.map((page) => (
+                  <Link
+                    key={page.url}
+                    href={page.url}
+                    className="group flex items-start justify-between gap-3 rounded-md px-2 py-1.5 transition-colors hover:bg-fd-accent"
+                  >
+                    <span className="text-sm leading-6 group-hover:text-fd-foreground">
+                      {page.data.title}
+                    </span>
+                    {page.data.date ? (
+                      <span className="shrink-0 text-xs leading-6 text-fd-muted-foreground">
+                        {formatDate(page.data.date)}
+                      </span>
+                    ) : null}
+                  </Link>
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
+      </section>
 
       <section className="grid gap-4 py-8 md:grid-cols-[180px_1fr]">
         <div>
