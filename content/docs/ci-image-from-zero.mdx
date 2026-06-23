@@ -1,0 +1,2103 @@
+---
+title: "从零理解 CI 镜像：构建环境、代码目录、执行命令和产物保存"
+description: "一篇面向小白的 CI 镜像入门文章：CI 镜像是什么，怎么构建，构建好了怎么用，代码在 CI 里放在哪里，命令在哪里执行，产物如何保存和发布。"
+date: "2026-06-23"
+tag: "CI"
+---
+
+# 从零理解 CI 镜像：构建环境、代码目录、执行命令和产物保存
+
+很多人第一次接触 CI 镜像时，会有一个很自然的困惑：
+
+> 我写好了 Dockerfile，也构建出了镜像，可是 CI 跑的时候，代码在哪里？它怎么知道去哪个目录执行命令？构建出来的 jar、zip、镜像又保存到哪里？
+
+这个问题非常关键。
+
+因为 **CI 镜像本身并不能完成整个 CI 流程**。
+
+CI 镜像只解决一个问题：
+
+> 这次构建要在什么环境里跑？
+
+但一个完整的 CI 流程还要解决另外几个问题：
+
+```text
+1. 代码从哪里来？
+2. 代码放到哪里？
+3. 在哪个目录执行命令？
+4. 执行什么命令？
+5. 构建产物放在哪里？
+6. 构建产物怎么给后续流程或其他人使用？
+```
+
+这篇文章就从头把这些问题讲清楚。
+
+---
+
+## 1. 先说结论：CI 镜像不是完整 CI，它只是构建环境
+
+你可以先记住一句话：
+
+> **CI 镜像只提供环境，CI 配置决定流程。**
+
+比如一个 Java 项目构建需要：
+
+```text
+JDK
+Maven
+Gradle
+Git
+curl
+gcc
+cmake
+make
+一些系统依赖
+```
+
+那你可以把这些工具提前装进一个 Docker 镜像里。
+
+这个镜像就叫 CI 镜像，也可以叫构建镜像、build image。
+
+但是这个镜像里面通常不放你的业务代码。
+
+业务代码由 CI 平台在每次流水线运行时自动拉取。
+
+所以 CI 镜像和项目代码是分开的。
+
+```text
+CI 镜像：JDK、Maven、Gradle、gcc、cmake 等工具
+项目代码：你的 src、pom.xml、build.gradle、package.json 等文件
+CI 配置：告诉平台怎么拉代码、用哪个镜像、执行什么命令、保存什么产物
+```
+
+---
+
+## 2. 一个 CI 任务大概是怎么跑起来的？
+
+以 GitLab CI、GitHub Actions、Jenkins 为例，一次 CI 任务大概是这样：
+
+```text
+1. 你 push 代码，或者提交 Merge Request
+2. CI 平台发现需要触发流水线
+3. CI Runner 准备一个临时工作目录
+4. CI 平台把你的仓库代码 checkout 到这个目录
+5. CI Runner 拉取你指定的 CI 镜像
+6. CI Runner 用这个镜像启动容器
+7. 把代码目录挂载到容器里的工作目录
+8. 在工作目录里执行 CI 配置中写的命令
+9. 命令执行结束后，收集产物、测试报告、日志
+10. 容器销毁
+```
+
+注意第 10 步：
+
+> **容器会销毁。**
+
+所以如果你没有显式保存产物，构建出来的 jar、zip、dist 目录就可能跟着临时环境一起消失。
+
+这也是为什么 CI 里不仅要写构建命令，还要写 `artifacts` 或者发布命令。
+
+---
+
+## 3. CI 镜像到底长什么样？
+
+最简单的 CI 镜像就是一个 Dockerfile。
+
+比如做一个 Java 17 + Maven 的 CI 镜像：
+
+```dockerfile
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    wget \
+    unzip \
+    openjdk-17-jdk \
+    maven \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN java -version && mvn -version && git --version
+```
+
+这个 Dockerfile 的含义是：
+
+```text
+FROM ubuntu:22.04
+    基于 Ubuntu 22.04 做镜像。
+
+RUN apt-get install ...
+    安装构建需要的工具。
+
+WORKDIR /workspace
+    设置默认工作目录。手动 docker run 时会比较方便。
+
+RUN java -version ...
+    构建镜像时顺便检查工具是否安装成功。
+```
+
+然后构建镜像：
+
+```bash
+docker build -t my-java-ci:17 .
+```
+
+查看镜像：
+
+```bash
+docker images
+```
+
+进入镜像验证：
+
+```bash
+docker run --rm -it my-java-ci:17 bash
+```
+
+在容器里试一下：
+
+```bash
+java -version
+mvn -version
+git --version
+```
+
+如果这些命令都正常，说明这个 CI 镜像作为“构建环境”基本可用。
+
+---
+
+## 4. 本地怎么用 CI 镜像构建项目？
+
+假设你的项目目录是：
+
+```text
+my-project/
+  pom.xml
+  src/
+```
+
+你可以在本地用这个 CI 镜像跑构建：
+
+```bash
+cd my-project
+
+docker run --rm \
+  -v "$PWD":/workspace \
+  -w /workspace \
+  my-java-ci:17 \
+  mvn clean package
+```
+
+这条命令很重要，可以拆开看。
+
+### 4.1 `docker run --rm`
+
+```bash
+docker run --rm
+```
+
+意思是启动一个临时容器，命令跑完之后自动删除容器。
+
+CI 里的容器也通常是临时的。
+
+---
+
+### 4.2 `-v "$PWD":/workspace`
+
+```bash
+-v "$PWD":/workspace
+```
+
+意思是把你当前目录挂载到容器里的 `/workspace`。
+
+比如你本地当前目录是：
+
+```text
+/Users/wpt/my-project
+```
+
+那容器里就能在这里看到同样的代码：
+
+```text
+/workspace
+```
+
+所以代码不是复制进镜像里的，而是运行容器时挂载进去的。
+
+---
+
+### 4.3 `-w /workspace`
+
+```bash
+-w /workspace
+```
+
+意思是让容器进入 `/workspace` 目录执行命令。
+
+相当于：
+
+```bash
+cd /workspace
+```
+
+---
+
+### 4.4 `my-java-ci:17`
+
+```bash
+my-java-ci:17
+```
+
+这是你要使用的 CI 镜像。
+
+它提供 JDK、Maven、Git 等工具。
+
+---
+
+### 4.5 `mvn clean package`
+
+```bash
+mvn clean package
+```
+
+这是容器里真正执行的构建命令。
+
+完整理解就是：
+
+```text
+用 my-java-ci:17 启动一个容器
+把当前项目目录挂载到容器的 /workspace
+进入 /workspace
+执行 mvn clean package
+执行结束后删除容器
+```
+
+---
+
+## 5. 真正 CI 里，代码到底放在哪里？
+
+本地用 `docker run` 时，是你自己用 `-v` 把代码挂进去。
+
+真正的 CI 平台里，这件事由 CI Runner 自动做。
+
+不同平台有不同默认目录。
+
+---
+
+## 6. GitLab CI 里代码在哪里？
+
+GitLab CI 默认会把代码放到：
+
+```bash
+$CI_PROJECT_DIR
+```
+
+一般长这样：
+
+```text
+/builds/group-name/project-name
+```
+
+也就是说，在 GitLab CI 里你通常不需要手动 clone 代码。
+
+GitLab Runner 会自动把当前仓库 checkout 到 `$CI_PROJECT_DIR`。
+
+一个最简单的 `.gitlab-ci.yml`：
+
+```yaml
+image: registry.example.com/infra/java-ci:17
+
+build:
+  script:
+    - pwd
+    - ls
+    - mvn clean package
+```
+
+这段配置的意思是：
+
+```text
+用 registry.example.com/infra/java-ci:17 这个镜像启动容器
+把代码 checkout 到默认项目目录
+进入默认项目目录
+执行 script 里的命令
+```
+
+你可以在脚本里打印：
+
+```yaml
+script:
+  - echo "当前目录是：$PWD"
+  - echo "GitLab 项目目录是：$CI_PROJECT_DIR"
+  - ls -la
+```
+
+你会发现默认就在项目根目录附近。
+
+---
+
+## 7. 如果代码不在仓库根目录怎么办？
+
+很多项目不是根目录直接构建，而是类似这样：
+
+```text
+repo/
+  README.md
+  backend/
+    pom.xml
+    src/
+  frontend/
+    package.json
+    src/
+```
+
+这时你要在 CI 配置里显式进入对应目录。
+
+比如构建后端：
+
+```yaml
+backend-build:
+  image: registry.example.com/infra/java-ci:17
+  script:
+    - cd "$CI_PROJECT_DIR/backend"
+    - mvn clean package
+```
+
+构建前端：
+
+```yaml
+frontend-build:
+  image: registry.example.com/infra/node-ci:20
+  script:
+    - cd "$CI_PROJECT_DIR/frontend"
+    - npm install
+    - npm run build
+```
+
+也就是说：
+
+> **去哪个目录执行命令，不是 CI 镜像决定的，而是 CI 配置里的 `cd` 或 `working-directory` 决定的。**
+
+---
+
+## 8. GitHub Actions 里代码在哪里？
+
+GitHub Actions 和 GitLab 有一点区别。
+
+GitHub Actions 通常需要你自己写 checkout 步骤：
+
+```yaml
+- uses: actions/checkout@v4
+```
+
+checkout 之后，代码默认放在：
+
+```bash
+$GITHUB_WORKSPACE
+```
+
+一般长这样：
+
+```text
+/home/runner/work/repo-name/repo-name
+```
+
+使用自定义 CI 镜像的例子：
+
+```yaml
+name: build
+
+on:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: registry.example.com/infra/java-ci:17
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show workspace
+        run: |
+          echo "$GITHUB_WORKSPACE"
+          pwd
+          ls -la
+
+      - name: Build
+        run: mvn clean package
+```
+
+如果项目在子目录：
+
+```yaml
+      - name: Build backend
+        working-directory: backend
+        run: mvn clean package
+```
+
+这里的：
+
+```yaml
+working-directory: backend
+```
+
+就相当于：
+
+```bash
+cd backend
+mvn clean package
+```
+
+---
+
+## 9. Jenkins 里代码在哪里？
+
+Jenkins 会把代码放到当前 Job 的 workspace。
+
+Pipeline 通常这样写：
+
+```groovy
+pipeline {
+    agent {
+        docker {
+            image 'registry.example.com/infra/java-ci:17'
+        }
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh 'pwd'
+                sh 'ls -la'
+                sh 'mvn clean package'
+            }
+        }
+    }
+}
+```
+
+如果项目在子目录：
+
+```groovy
+stage('Build Backend') {
+    steps {
+        dir('backend') {
+            sh 'mvn clean package'
+        }
+    }
+}
+```
+
+这里的：
+
+```groovy
+dir('backend') {
+    sh 'mvn clean package'
+}
+```
+
+意思就是进入 `backend` 目录执行命令。
+
+---
+
+## 10. Dockerfile 里的 WORKDIR 和 CI 里的工作目录是什么关系？
+
+很多人会问：
+
+> 我 Dockerfile 里写了 `WORKDIR /workspace`，那 CI 里是不是一定在 `/workspace` 执行？
+
+不一定。
+
+`WORKDIR` 对手动运行容器很有用：
+
+```dockerfile
+WORKDIR /workspace
+```
+
+手动执行：
+
+```bash
+docker run --rm -it my-java-ci:17 bash
+```
+
+默认会进入 `/workspace`。
+
+但是在 CI 平台里，Runner 可能会覆盖默认工作目录。
+
+比如：
+
+```text
+GitLab CI：/builds/group/project
+GitHub Actions：/__w/repo/repo 或 /github/workspace
+Jenkins：/var/jenkins_home/workspace/job-name
+```
+
+所以在 CI 里，不要强依赖 Dockerfile 的 `WORKDIR`。
+
+更可靠的做法是使用 CI 平台提供的变量：
+
+```bash
+$CI_PROJECT_DIR
+$GITHUB_WORKSPACE
+$WORKSPACE
+```
+
+或者在 CI 配置里显式 `cd`。
+
+---
+
+## 11. 构建命令写在哪里？
+
+构建命令写在 CI 配置文件里，而不是写死在 CI 镜像里。
+
+比如 GitLab CI：
+
+```yaml
+build:
+  image: registry.example.com/infra/java-ci:17
+  script:
+    - mvn clean package
+```
+
+GitHub Actions：
+
+```yaml
+      - name: Build
+        run: mvn clean package
+```
+
+Jenkins：
+
+```groovy
+sh 'mvn clean package'
+```
+
+CI 镜像里一般不要写：
+
+```dockerfile
+CMD ["mvn", "clean", "package"]
+```
+
+为什么？
+
+因为 CI 镜像应该是通用环境。
+
+同一个 Java CI 镜像可能被很多项目复用：
+
+```text
+A 项目执行：mvn clean package
+B 项目执行：./gradlew build
+C 项目执行：mvn test
+D 项目执行：mvn deploy
+```
+
+如果你把命令写死在镜像里，镜像就不通用了。
+
+更推荐：
+
+```text
+CI 镜像：只放工具
+CI 配置：写具体命令
+```
+
+---
+
+## 12. 构建产物是什么？
+
+构建产物就是构建命令跑完后生成的文件。
+
+不同项目的产物不同。
+
+### Java Maven 项目
+
+```bash
+mvn clean package
+```
+
+常见产物：
+
+```text
+target/*.jar
+target/*.war
+```
+
+### Java Gradle 项目
+
+```bash
+./gradlew clean build
+```
+
+常见产物：
+
+```text
+build/libs/*.jar
+```
+
+多模块项目可能是：
+
+```text
+*/build/libs/*.jar
+**/build/libs/*.jar
+```
+
+### 前端项目
+
+```bash
+npm run build
+```
+
+常见产物：
+
+```text
+dist/
+build/
+```
+
+### Python 项目
+
+```bash
+python -m build
+```
+
+常见产物：
+
+```text
+dist/*.whl
+dist/*.tar.gz
+```
+
+### Docker 镜像项目
+
+```bash
+docker build -t xxx .
+```
+
+产物是：
+
+```text
+一个 Docker 镜像
+```
+
+如果不 push 到镜像仓库，这个镜像通常只存在于 CI Runner 当前环境里。
+
+---
+
+## 13. 为什么构建出来的产物不会自动留下来？
+
+因为 CI 的执行环境通常是临时的。
+
+一次 Job 大概是：
+
+```text
+启动临时容器
+  ↓
+checkout 代码
+  ↓
+执行构建命令
+  ↓
+生成产物
+  ↓
+上传指定产物
+  ↓
+销毁容器和临时目录
+```
+
+如果你没有告诉 CI：
+
+```text
+请保存 target/*.jar
+请保存 build/libs/*.jar
+请保存 dist/
+请上传到 Maven 仓库
+请 push 到镜像仓库
+```
+
+那 CI 不知道哪些文件对你重要。
+
+所以默认情况下，构建产物只是临时文件。
+
+---
+
+## 14. GitLab CI 怎么保存产物？
+
+GitLab CI 里用 `artifacts`。
+
+Maven 项目：
+
+```yaml
+build:
+  image: registry.example.com/infra/java-ci:17
+  script:
+    - mvn clean package
+  artifacts:
+    paths:
+      - target/*.jar
+    expire_in: 7 days
+```
+
+Gradle 项目：
+
+```yaml
+build:
+  image: registry.example.com/infra/java-ci:17
+  script:
+    - ./gradlew clean build
+  artifacts:
+    paths:
+      - build/libs/*.jar
+    expire_in: 7 days
+```
+
+前端项目：
+
+```yaml
+build:
+  image: registry.example.com/infra/node-ci:20
+  script:
+    - npm ci
+    - npm run build
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 7 days
+```
+
+这表示：
+
+```text
+构建完成后，把这些路径对应的文件保存为 CI Artifact。
+```
+
+然后你就可以在 GitLab 的流水线页面下载这些文件。
+
+---
+
+## 15. Artifact 是正式发布吗？
+
+不是。
+
+CI Artifact 更像是：
+
+> 这次流水线执行结果的附件。
+
+它适合：
+
+```text
+临时下载 jar 看看
+给后续 Job 使用
+保存测试报告
+保存构建日志
+保存前端 dist 供预览
+```
+
+但是它通常会过期。
+
+比如：
+
+```yaml
+expire_in: 7 days
+```
+
+表示 7 天后可能被清理。
+
+如果这个产物要长期给别人依赖，就应该发布到正式制品仓库。
+
+例如：
+
+```text
+Java jar → Maven 仓库
+Node 包 → npm registry
+Python 包 → PyPI 或私有源
+Docker 镜像 → 镜像仓库
+二进制文件 → 公司制品库 / 对象存储
+```
+
+---
+
+## 16. 后续 Job 怎么使用前面 Job 的产物？
+
+假设你有两个阶段：
+
+```text
+build 阶段：生成 jar
+test-artifact 阶段：拿 jar 做验证
+```
+
+GitLab CI 可以这样：
+
+```yaml
+stages:
+  - build
+  - test
+
+build:
+  stage: build
+  image: registry.example.com/infra/java-ci:17
+  script:
+    - ./gradlew clean build
+  artifacts:
+    paths:
+      - build/libs/*.jar
+    expire_in: 7 days
+
+test-artifact:
+  stage: test
+  image: registry.example.com/infra/java-ci:17
+  needs:
+    - job: build
+      artifacts: true
+  script:
+    - ls -lh build/libs/
+    - java -jar build/libs/*.jar --version
+```
+
+这里的重点是：
+
+```yaml
+needs:
+  - job: build
+    artifacts: true
+```
+
+意思是：
+
+> 这个 Job 需要下载 build Job 产生的 artifacts。
+
+---
+
+## 17. GitHub Actions 怎么保存产物？
+
+GitHub Actions 里通常使用 `actions/upload-artifact`。
+
+```yaml
+name: build
+
+on:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: registry.example.com/infra/java-ci:17
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: mvn clean package
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/*.jar
+```
+
+后续 Job 可以用 `actions/download-artifact` 下载。
+
+```yaml
+  test-artifact:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download jar
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: artifact
+
+      - name: Show artifact
+        run: ls -lh artifact
+```
+
+---
+
+## 18. Jenkins 怎么保存产物？
+
+Jenkins Pipeline 可以用 `archiveArtifacts`。
+
+```groovy
+pipeline {
+    agent {
+        docker {
+            image 'registry.example.com/infra/java-ci:17'
+        }
+    }
+
+    stages {
+        stage('Build') {
+            steps {
+                sh 'mvn clean package'
+            }
+        }
+    }
+
+    post {
+        success {
+            archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+        }
+    }
+}
+```
+
+这样 Jenkins 会把 `target/*.jar` 作为构建产物保存起来。
+
+---
+
+## 19. 正式发布 Java jar：Maven / Gradle
+
+如果你希望别人可以通过 Maven 坐标依赖这个 jar，例如：
+
+```xml
+<dependency>
+  <groupId>com.example</groupId>
+  <artifactId>demo</artifactId>
+  <version>1.0.0</version>
+</dependency>
+```
+
+那就不能只保存 CI Artifact。
+
+你需要把 jar 发布到 Maven 仓库。
+
+Maven 项目通常是：
+
+```bash
+mvn deploy
+```
+
+Gradle 项目通常是：
+
+```bash
+./gradlew publish
+```
+
+一个 GitLab CI 示例：
+
+```yaml
+stages:
+  - build
+  - publish
+
+build:
+  stage: build
+  image: registry.example.com/infra/java-ci:17
+  script:
+    - ./gradlew clean build
+  artifacts:
+    paths:
+      - build/libs/*.jar
+    expire_in: 7 days
+
+publish:
+  stage: publish
+  image: registry.example.com/infra/java-ci:17
+  needs:
+    - job: build
+      artifacts: true
+  script:
+    - ./gradlew publish
+  rules:
+    - if: '$CI_COMMIT_TAG'
+```
+
+这里：
+
+```yaml
+rules:
+  - if: '$CI_COMMIT_TAG'
+```
+
+表示只有打 tag 的时候才发布。
+
+这样比较合理：
+
+```text
+普通 commit：只构建、测试
+打 tag：构建、测试、正式发布
+```
+
+---
+
+## 20. 正式发布 Docker 镜像
+
+如果你的最终产物是一个业务 Docker 镜像，那流程是：
+
+```text
+CI 镜像启动构建环境
+  ↓
+checkout 代码
+  ↓
+构建 jar / dist
+  ↓
+docker build 生成业务镜像
+  ↓
+docker push 推送到镜像仓库
+```
+
+注意这里有两个镜像：
+
+```text
+CI 镜像：用来构建项目的环境
+业务镜像：最终部署运行的应用镜像
+```
+
+它们不是一个东西。
+
+例如：
+
+```text
+CI 镜像：
+registry.example.com/infra/java-ci:17
+
+业务镜像：
+registry.example.com/app/my-service:1.0.0
+```
+
+一个 GitLab CI 示例：
+
+```yaml
+stages:
+  - build
+  - image
+
+build:
+  stage: build
+  image: registry.example.com/infra/java-ci:17
+  script:
+    - mvn clean package
+  artifacts:
+    paths:
+      - target/*.jar
+    expire_in: 7 days
+
+build-image:
+  stage: image
+  image: docker:stable
+  services:
+    - docker:dind
+  needs:
+    - job: build
+      artifacts: true
+  script:
+    - docker build -t registry.example.com/app/my-service:$CI_COMMIT_SHORT_SHA .
+    - docker push registry.example.com/app/my-service:$CI_COMMIT_SHORT_SHA
+```
+
+---
+
+## 21. CI 镜像和业务镜像有什么区别？
+
+这是小白特别容易混的地方。
+
+### CI 镜像
+
+CI 镜像是构建环境。
+
+里面通常有：
+
+```text
+JDK
+Maven
+Gradle
+Node.js
+Python
+gcc
+cmake
+make
+git
+curl
+```
+
+它的用途是：
+
+```text
+编译代码
+跑测试
+打包产物
+上传制品
+```
+
+例如：
+
+```text
+registry.example.com/infra/java-ci:17
+```
+
+---
+
+### 业务镜像
+
+业务镜像是运行环境。
+
+里面通常有：
+
+```text
+你的应用 jar
+启动脚本
+运行时依赖
+```
+
+它的用途是：
+
+```text
+部署到 Kubernetes
+部署到服务器
+给线上服务运行
+```
+
+例如：
+
+```text
+registry.example.com/app/order-service:1.0.0
+```
+
+---
+
+### 对比
+
+```text
+CI 镜像解决：怎么构建？
+业务镜像解决：怎么运行？
+
+CI 镜像给 CI Runner 用。
+业务镜像给部署平台用。
+
+CI 镜像通常包含很多构建工具，体积可能很大。
+业务镜像应该尽量小，只包含运行所需内容。
+```
+
+---
+
+## 22. 缓存和产物有什么区别？
+
+缓存和产物也很容易混。
+
+### 产物 Artifact
+
+产物是这次构建真正生成的结果。
+
+比如：
+
+```text
+target/app.jar
+build/libs/app.jar
+dist/
+coverage-report/
+```
+
+它代表这次流水线的输出。
+
+---
+
+### 缓存 Cache
+
+缓存是为了加速下次构建。
+
+比如：
+
+```text
+~/.m2/repository
+~/.gradle/caches
+node_modules
+.pnpm-store
+pip cache
+```
+
+缓存不是最终结果。
+
+缓存坏了可以删掉，重新下载依赖即可。
+
+---
+
+### GitLab CI 缓存示例
+
+Maven 缓存：
+
+```yaml
+cache:
+  key: maven-cache
+  paths:
+    - .m2/repository/
+
+build:
+  image: registry.example.com/infra/java-ci:17
+  script:
+    - mvn -Dmaven.repo.local=.m2/repository clean package
+  artifacts:
+    paths:
+      - target/*.jar
+```
+
+Gradle 缓存：
+
+```yaml
+cache:
+  key: gradle-cache
+  paths:
+    - .gradle/caches/
+    - .gradle/wrapper/
+
+build:
+  image: registry.example.com/infra/java-ci:17
+  script:
+    - ./gradlew clean build --gradle-user-home .gradle
+  artifacts:
+    paths:
+      - build/libs/*.jar
+```
+
+简单理解：
+
+```text
+cache：为了下次跑得快
+artifacts：为了保存这次构建结果
+```
+
+---
+
+## 23. 一个完整的 GitLab CI 例子
+
+假设项目结构是：
+
+```text
+repo/
+  backend/
+    build.gradle
+    src/
+  Dockerfile
+```
+
+目标：
+
+```text
+1. 使用自定义 Java CI 镜像
+2. 进入 backend 目录构建
+3. 保存 jar 产物
+4. 打 tag 时发布 jar
+```
+
+`.gitlab-ci.yml` 可以这样：
+
+```yaml
+stages:
+  - build
+  - publish
+
+variables:
+  GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle"
+
+cache:
+  key: gradle-cache
+  paths:
+    - .gradle/caches/
+    - .gradle/wrapper/
+
+build:
+  stage: build
+  image: registry.example.com/infra/java-ci:17
+  script:
+    - echo "项目目录：$CI_PROJECT_DIR"
+    - cd "$CI_PROJECT_DIR/backend"
+    - ./gradlew clean build --gradle-user-home "$GRADLE_USER_HOME"
+  artifacts:
+    paths:
+      - backend/build/libs/*.jar
+    expire_in: 7 days
+
+publish:
+  stage: publish
+  image: registry.example.com/infra/java-ci:17
+  needs:
+    - job: build
+      artifacts: true
+  script:
+    - cd "$CI_PROJECT_DIR/backend"
+    - ./gradlew publish --gradle-user-home "$GRADLE_USER_HOME"
+  rules:
+    - if: '$CI_COMMIT_TAG'
+```
+
+这份配置回答了几个关键问题：
+
+```text
+用什么环境？
+    image: registry.example.com/infra/java-ci:17
+
+代码在哪里？
+    $CI_PROJECT_DIR
+
+去哪个目录执行？
+    cd "$CI_PROJECT_DIR/backend"
+
+执行什么命令？
+    ./gradlew clean build
+
+产物在哪里？
+    backend/build/libs/*.jar
+
+怎么保存产物？
+    artifacts.paths
+
+什么时候正式发布？
+    打 tag 时执行 publish
+```
+
+---
+
+## 24. 一个完整的 GitHub Actions 例子
+
+假设项目结构：
+
+```text
+repo/
+  backend/
+    pom.xml
+    src/
+```
+
+工作流：
+
+```yaml
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: registry.example.com/infra/java-ci:17
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show workspace
+        run: |
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          pwd
+          ls -la
+
+      - name: Build backend
+        working-directory: backend
+        run: mvn clean package
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-jar
+          path: backend/target/*.jar
+```
+
+这份配置回答了：
+
+```text
+用什么环境？
+    container.image
+
+代码怎么来？
+    actions/checkout
+
+代码在哪里？
+    $GITHUB_WORKSPACE
+
+去哪个目录执行？
+    working-directory: backend
+
+执行什么命令？
+    mvn clean package
+
+产物怎么保存？
+    actions/upload-artifact
+```
+
+---
+
+## 25. 一个完整的 Jenkins 例子
+
+```groovy
+pipeline {
+    agent {
+        docker {
+            image 'registry.example.com/infra/java-ci:17'
+        }
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh 'pwd'
+                sh 'ls -la'
+                dir('backend') {
+                    sh 'mvn clean package'
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            archiveArtifacts artifacts: 'backend/target/*.jar', fingerprint: true
+        }
+    }
+}
+```
+
+这份 Jenkinsfile 也回答了同样几个问题：
+
+```text
+用什么环境？
+    agent docker image
+
+代码怎么来？
+    checkout scm
+
+去哪个目录执行？
+    dir('backend')
+
+执行什么命令？
+    mvn clean package
+
+产物怎么保存？
+    archiveArtifacts
+```
+
+---
+
+## 26. CI 镜像怎么推给 CI 平台使用？
+
+本地构建出来的镜像只能在本地用。
+
+如果 CI Runner 在别的机器上，它拉不到你本地镜像。
+
+所以你需要把镜像推到镜像仓库。
+
+例如：
+
+```bash
+docker build -t my-java-ci:17 .
+```
+
+打远程 tag：
+
+```bash
+docker tag my-java-ci:17 registry.example.com/infra/java-ci:17
+```
+
+登录镜像仓库：
+
+```bash
+docker login registry.example.com
+```
+
+推送：
+
+```bash
+docker push registry.example.com/infra/java-ci:17
+```
+
+然后 CI 配置里使用：
+
+```yaml
+image: registry.example.com/infra/java-ci:17
+```
+
+或者 GitHub Actions：
+
+```yaml
+container:
+  image: registry.example.com/infra/java-ci:17
+```
+
+或者 Jenkins：
+
+```groovy
+agent {
+    docker {
+        image 'registry.example.com/infra/java-ci:17'
+    }
+}
+```
+
+---
+
+## 27. Tag 应该怎么命名？
+
+不要长期依赖 `latest`。
+
+不推荐：
+
+```yaml
+image: registry.example.com/infra/java-ci:latest
+```
+
+因为 `latest` 变了之后，你的 CI 环境也会悄悄变。
+
+今天能过，明天突然不过，你排查起来会很难受。
+
+更推荐明确版本：
+
+```text
+registry.example.com/infra/java-ci:ubuntu22.04-jdk17-maven3.9-v1
+registry.example.com/infra/java-ci:jdk17-v1
+registry.example.com/infra/cpp-ci:ubuntu20.04-gcc9-cmake3.22-v1
+```
+
+镜像 tag 最好能看出：
+
+```text
+基础系统版本
+主要语言版本
+主要构建工具版本
+镜像自身版本
+```
+
+---
+
+## 28. CI 镜像里要不要放业务代码？
+
+一般不要。
+
+错误理解：
+
+```text
+把代码 COPY 进 CI 镜像
+CI 直接运行镜像里的代码
+```
+
+这通常不适合作为普通 CI 镜像。
+
+更推荐：
+
+```text
+CI 镜像只放工具
+CI 平台每次 checkout 最新代码
+CI 配置决定执行什么命令
+```
+
+因为代码每次都在变，而构建环境相对稳定。
+
+如果你把代码也放进 CI 镜像，那每次代码变化都要重新构建 CI 镜像，完全没有必要。
+
+---
+
+## 29. CI 镜像里要不要放 Gradle/Maven？
+
+这个要看项目。
+
+如果项目有 Gradle Wrapper：
+
+```text
+gradlew
+gradle/wrapper/gradle-wrapper.jar
+gradle/wrapper/gradle-wrapper.properties
+```
+
+那 CI 镜像里可以不提前安装 Gradle。
+
+CI 里直接：
+
+```bash
+./gradlew build
+```
+
+Gradle Wrapper 会根据项目指定版本下载或使用 Gradle。
+
+但是公司内网环境可能不能访问外网，这时要么：
+
+```text
+1. 配置内部 Gradle 分发地址
+2. 镜像里提前安装 Gradle
+3. 镜像里提前准备 wrapper 所需依赖
+```
+
+Maven 也类似。
+
+如果项目用 Maven Wrapper：
+
+```bash
+./mvnw clean package
+```
+
+可以减少 CI 镜像对 Maven 版本的依赖。
+
+---
+
+## 30. CI 镜像越大越好吗？
+
+不是。
+
+CI 镜像太大会有几个问题：
+
+```text
+拉取慢
+构建慢
+占用存储
+安全扫描问题更多
+维护困难
+```
+
+但 CI 镜像也不能太小。
+
+太小就会导致每次 CI 都临时安装依赖：
+
+```bash
+apt-get update
+apt-get install ...
+```
+
+这会让构建变慢、不稳定，还容易受外部网络影响。
+
+比较好的平衡是：
+
+```text
+稳定且通用的构建工具放进镜像
+项目级依赖通过包管理器和缓存解决
+敏感凭证不要放进镜像
+业务代码不要放进镜像
+```
+
+---
+
+## 31. 密码、Token、私服账号能不能写进 CI 镜像？
+
+不能。
+
+不要在 Dockerfile 里写：
+
+```dockerfile
+ENV MAVEN_PASSWORD=xxx
+ENV NPM_TOKEN=xxx
+RUN echo "password=xxx" > settings.xml
+```
+
+这样会把敏感信息固化进镜像层里。
+
+别人只要能拉到镜像，就可能拿到这些信息。
+
+正确做法是使用 CI 平台的变量或密钥管理。
+
+GitLab CI：
+
+```yaml
+script:
+  - echo "$MAVEN_SETTINGS_XML" > ~/.m2/settings.xml
+  - mvn deploy
+```
+
+GitHub Actions：
+
+```yaml
+env:
+  NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+Jenkins：
+
+```groovy
+withCredentials([string(credentialsId: 'maven-token', variable: 'MAVEN_TOKEN')]) {
+    sh 'mvn deploy'
+}
+```
+
+简单说：
+
+```text
+工具放镜像
+密钥放 CI Secret
+代码由 CI checkout
+产物上传到制品仓库
+```
+
+---
+
+## 32. 怎么排查 CI 里的目录问题？
+
+目录问题是 CI 新手最常遇到的问题。
+
+比如报错：
+
+```text
+pom.xml not found
+build.gradle not found
+package.json not found
+No such file or directory
+```
+
+第一步永远是打印目录：
+
+```yaml
+script:
+  - pwd
+  - echo "$CI_PROJECT_DIR"
+  - ls -la
+  - find . -maxdepth 3 -type f | sort | head -100
+```
+
+GitHub Actions：
+
+```yaml
+- name: Debug workspace
+  run: |
+    pwd
+    echo "$GITHUB_WORKSPACE"
+    ls -la
+    find . -maxdepth 3 -type f | sort | head -100
+```
+
+Jenkins：
+
+```groovy
+sh 'pwd'
+sh 'ls -la'
+sh 'find . -maxdepth 3 -type f | sort | head -100'
+```
+
+看到真实目录结构以后，再决定要不要 `cd backend`、`cd java`、`cd service-a`。
+
+---
+
+## 33. 怎么排查 CI 镜像里缺工具？
+
+如果报错：
+
+```text
+mvn: command not found
+gradle: command not found
+java: command not found
+gcc: command not found
+```
+
+说明当前 Job 使用的镜像里没有这个工具，或者 PATH 没配好。
+
+可以在 CI 里加：
+
+```yaml
+script:
+  - which java || true
+  - java -version || true
+  - which mvn || true
+  - mvn -version || true
+  - which gradle || true
+  - gradle -version || true
+```
+
+如果确实没有，就回到 CI 镜像 Dockerfile 里安装，重新构建、推送、更新 CI 配置里的 image tag。
+
+---
+
+## 34. 怎么排查产物路径不对？
+
+如果 CI 构建成功，但 artifacts 没上传，常见原因是路径写错。
+
+比如 Maven 实际生成：
+
+```text
+backend/target/app.jar
+```
+
+但你写的是：
+
+```yaml
+artifacts:
+  paths:
+    - target/*.jar
+```
+
+这就找不到。
+
+排查方式：
+
+```yaml
+script:
+  - mvn clean package
+  - find . -name "*.jar" -type f -print
+```
+
+然后根据输出结果改 `artifacts.paths`。
+
+例如：
+
+```yaml
+artifacts:
+  paths:
+    - backend/target/*.jar
+```
+
+Gradle 同理：
+
+```yaml
+script:
+  - ./gradlew clean build
+  - find . -name "*.jar" -type f -print
+```
+
+---
+
+## 35. 一个小白版心智模型
+
+可以把 CI 想象成一个临时工位。
+
+```text
+CI 镜像 = 工位上提前装好的工具箱
+代码仓库 = 今天要处理的材料
+CI Runner = 帮你把材料搬到工位的人
+CI 配置 = 工作说明书
+Artifact = 做完以后要留下的成品
+Cache = 上次留下来、为了下次更快的工具缓存
+制品仓库 = 正式仓库，别人以后从这里拿成品
+```
+
+所以完整流程是：
+
+```text
+Runner 准备临时工位
+  ↓
+拉取 CI 镜像，拿到工具箱
+  ↓
+checkout 代码，把材料放到工位
+  ↓
+根据 CI 配置进入指定目录
+  ↓
+执行构建命令
+  ↓
+生成产物
+  ↓
+保存 Artifact 或上传制品仓库
+  ↓
+销毁临时工位
+```
+
+---
+
+## 36. 常见问题 FAQ
+
+### Q1：CI 镜像里为什么不放代码？
+
+因为代码经常变，构建环境相对稳定。
+
+CI 镜像是环境模板，项目代码由 CI 每次 checkout 最新版本。
+
+---
+
+### Q2：CI 怎么知道代码放在哪里？
+
+由 CI 平台决定。
+
+常见变量：
+
+```text
+GitLab CI：$CI_PROJECT_DIR
+GitHub Actions：$GITHUB_WORKSPACE
+Jenkins：$WORKSPACE
+```
+
+你可以用 `pwd` 和 `ls -la` 打印确认。
+
+---
+
+### Q3：CI 怎么知道执行什么命令？
+
+由 CI 配置决定。
+
+例如 GitLab CI：
+
+```yaml
+script:
+  - mvn clean package
+```
+
+GitHub Actions：
+
+```yaml
+run: mvn clean package
+```
+
+Jenkins：
+
+```groovy
+sh 'mvn clean package'
+```
+
+---
+
+### Q4：CI 镜像里的 WORKDIR 有什么用？
+
+手动运行容器时有用。
+
+但在 CI 平台里，Runner 可能会把工作目录覆盖成自己的 workspace。
+
+所以 CI 里更推荐用平台变量或显式 `cd`。
+
+---
+
+### Q5：构建出来的 jar 默认会留下吗？
+
+不会可靠留下。
+
+你需要显式配置 artifacts，或者上传到 Maven 仓库。
+
+GitLab CI：
+
+```yaml
+artifacts:
+  paths:
+    - target/*.jar
+```
+
+GitHub Actions：
+
+```yaml
+- uses: actions/upload-artifact@v4
+  with:
+    path: target/*.jar
+```
+
+Jenkins：
+
+```groovy
+archiveArtifacts artifacts: 'target/*.jar'
+```
+
+---
+
+### Q6：Artifact 和 Maven 仓库有什么区别？
+
+Artifact 是某次 CI 的临时附件。
+
+Maven 仓库是正式制品仓库，给其他项目长期依赖。
+
+```text
+临时查看 → CI Artifact
+正式依赖 → Maven 仓库
+```
+
+---
+
+### Q7：CI 镜像和业务镜像有什么区别？
+
+CI 镜像用来构建。
+
+业务镜像用来运行。
+
+```text
+CI 镜像：JDK、Maven、Gradle、gcc、cmake
+业务镜像：你的应用 jar、启动脚本、运行时依赖
+```
+
+---
+
+### Q8：为什么不在 CI 里每次 apt-get install？
+
+可以，但不推荐。
+
+缺点：
+
+```text
+慢
+不稳定
+依赖外部网络
+版本可能变化
+失败难排查
+```
+
+CI 镜像的价值就是把环境提前固化。
+
+---
+
+### Q9：镜像构建好了，CI 为什么还是拉不到？
+
+常见原因：
+
+```text
+镜像没有 push 到远程仓库
+CI Runner 没有仓库权限
+image 地址写错
+tag 写错
+私有仓库没有配置登录凭证
+```
+
+排查方式：
+
+```bash
+docker pull registry.example.com/infra/java-ci:17
+```
+
+如果本地也拉不到，说明镜像仓库或权限有问题。
+
+---
+
+### Q10：CI 产物路径明明写了，为什么提示 no matching files？
+
+说明路径不对。
+
+先加：
+
+```bash
+find . -type f | sort | head -200
+find . -name "*.jar" -type f -print
+```
+
+确认真实文件位置，再改 artifacts path。
+
+---
+
+## 37. 最后总结
+
+CI 镜像只是 CI 体系的一部分。
+
+一个完整 CI 要同时回答这些问题：
+
+```text
+1. 用什么环境？
+    CI 镜像负责。
+
+2. 代码从哪里来？
+    CI 平台 checkout。
+
+3. 代码放在哪里？
+    GitLab 是 $CI_PROJECT_DIR。
+    GitHub Actions 是 $GITHUB_WORKSPACE。
+    Jenkins 是 $WORKSPACE。
+
+4. 去哪个目录执行？
+    CI 配置里的 cd、working-directory、dir 决定。
+
+5. 执行什么命令？
+    CI 配置里的 script、run、sh 决定。
+
+6. 产物怎么保存？
+    artifacts、upload-artifact、archiveArtifacts 决定。
+
+7. 产物怎么正式发布？
+    Maven 仓库、npm registry、PyPI、Docker Registry、公司制品库决定。
+```
+
+最重要的一句话是：
+
+> **CI 镜像解决“在哪个环境跑”，CI 配置解决“怎么跑”，Artifact 或制品仓库解决“构建结果怎么留下来”。**
