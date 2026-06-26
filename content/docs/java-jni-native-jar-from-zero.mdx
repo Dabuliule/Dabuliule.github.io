@@ -1,0 +1,869 @@
+---
+title: "从零理解 JNI：Java 如何调用 C++，又如何把 native 库打进 jar"
+description: "从一个最小 JNI HelloWorld 开始，讲清楚 Java native 方法、javac -h、C++ JNI 函数、动态库、java.library.path，以及像 RocksDB Java 那样把 native 库放进 jar 并运行时解压加载的基本原理。"
+date: "2026-06-26"
+tag: "Java"
+---
+
+很多 Java 开发者第一次看到 RocksDB Java、Netty native transport、SQLite JDBC 这类库时，会有一个疑问：
+
+> 明明我引入的是一个 jar，为什么里面还能跑 C++ 代码？
+
+这个问题背后其实是 JNI。
+
+JNI，全称 Java Native Interface，它允许 Java 调用本地代码，比如 C、C++ 编译出来的动态库。
+
+这篇文章从最小例子开始，讲清楚这条链路：
+
+```text
+Java native 方法
+    ↓
+javac -h 生成 JNI 头文件
+    ↓
+C++ 实现 JNI 函数
+    ↓
+g++ 编译动态库
+    ↓
+Java 加载动态库并调用
+    ↓
+把 class 和 native 库一起打进 jar
+```
+
+最后我们会看到，像 RocksDB Java 这类库的核心套路其实就是：
+
+```text
+Java API
++ native 方法声明
++ 平台相关动态库
++ jar 内资源
++ 运行时解压
++ System.load 加载
+```
+
+---
+
+## 1. JNI 解决的是什么问题？
+
+正常情况下，Java 代码只能直接调用 Java 方法。
+
+比如：
+
+```java
+public int add(int a, int b) {
+    return a + b;
+}
+```
+
+这个方法体在 Java 里。
+
+但有时候我们希望 Java 调用 C++：
+
+- 复用已有 C/C++ 库
+- 调用操作系统底层能力
+- 使用某些高性能 native 实现
+- 给 Java 提供一个更友好的 API 包装
+
+这时候 Java 里可以只声明方法，不写方法体：
+
+```java
+public native int add(int a, int b);
+```
+
+`native` 的意思是：
+
+> 这个方法不是 Java 实现的，去本地动态库里找。
+
+---
+
+## 2. 最小例子：Java 调用 C++
+
+先写一个 Java 类：
+
+```java
+public class HelloNative {
+    static {
+        System.loadLibrary("hello");
+    }
+
+    public native String sayHello(String name);
+
+    public static void main(String[] args) {
+        HelloNative hello = new HelloNative();
+        System.out.println(hello.sayHello("Java"));
+    }
+}
+```
+
+这里有两个关键点。
+
+第一个是：
+
+```java
+public native String sayHello(String name);
+```
+
+它声明了一个 native 方法。
+
+第二个是：
+
+```java
+System.loadLibrary("hello");
+```
+
+它告诉 JVM 加载名为 `hello` 的本地库。
+
+在不同系统上，JVM 会找不同文件：
+
+```text
+macOS   -> libhello.dylib
+Linux   -> libhello.so
+Windows -> hello.dll
+```
+
+也就是说：
+
+```java
+System.loadLibrary("hello");
+```
+
+在 macOS 上对应：
+
+```text
+libhello.dylib
+```
+
+---
+
+## 3. javac -h 生成 JNI 头文件
+
+Java 写好后，需要先编译，并生成 JNI 头文件：
+
+```bash
+javac -h build/generated -d build/classes src/HelloNative.java
+```
+
+这里：
+
+```text
+-d build/classes
+```
+
+表示把 `.class` 文件输出到 `build/classes`。
+
+```text
+-h build/generated
+```
+
+表示把 JNI 头文件输出到 `build/generated`。
+
+执行后会得到：
+
+```text
+build/classes/HelloNative.class
+build/generated/HelloNative.h
+```
+
+`HelloNative.h` 里会有类似这样的声明：
+
+```cpp
+JNIEXPORT jstring JNICALL Java_HelloNative_sayHello
+  (JNIEnv *, jobject, jstring);
+```
+
+这个声明告诉 C++：
+
+> Java 需要一个叫 `Java_HelloNative_sayHello` 的函数。
+
+JNI 函数名规则是：
+
+```text
+Java_类名_方法名
+```
+
+所以：
+
+```text
+HelloNative.sayHello
+```
+
+对应：
+
+```cpp
+Java_HelloNative_sayHello
+```
+
+---
+
+## 4. C++ 实现 JNI 函数
+
+C++ 里实现这个函数：
+
+```cpp
+#include "HelloNative.h"
+
+#include <string>
+
+extern "C" JNIEXPORT jstring JNICALL Java_HelloNative_sayHello(
+    JNIEnv* env,
+    jobject,
+    jstring name) {
+  const char* raw_name = env->GetStringUTFChars(name, nullptr);
+  if (raw_name == nullptr) {
+    return nullptr;
+  }
+
+  std::string message = "Hello from C++, ";
+  message += raw_name;
+
+  env->ReleaseStringUTFChars(name, raw_name);
+  return env->NewStringUTF(message.c_str());
+}
+```
+
+这里几个东西很重要。
+
+```cpp
+#include "HelloNative.h"
+```
+
+引入 `javac -h` 生成的头文件。
+
+```cpp
+extern "C"
+```
+
+告诉 C++ 不要按 C++ 规则改函数名。
+
+JNI 是靠固定函数名查找的，如果 C++ 编译器改了名字，JVM 就找不到了。
+
+```cpp
+JNIEnv* env
+```
+
+这是 JNI 提供的工具箱。
+
+处理 Java 字符串、数组、对象、异常，基本都要靠它。
+
+```cpp
+jstring name
+```
+
+Java 的 `String` 到 C++ JNI 里是 `jstring`。
+
+不能直接当 `std::string` 用。
+
+所以要先转：
+
+```cpp
+const char* raw_name = env->GetStringUTFChars(name, nullptr);
+```
+
+用完后要释放：
+
+```cpp
+env->ReleaseStringUTFChars(name, raw_name);
+```
+
+最后返回 Java 字符串：
+
+```cpp
+return env->NewStringUTF(message.c_str());
+```
+
+---
+
+## 5. 编译成动态库
+
+macOS 上可以这样编译：
+
+```bash
+g++ -dynamiclib \
+  -I"$JAVA_HOME/include" \
+  -I"$JAVA_HOME/include/darwin" \
+  -I"build/generated" \
+  native/hello.cpp \
+  -o build/lib/libhello.dylib
+```
+
+这里：
+
+```text
+-dynamiclib
+```
+
+表示生成 macOS 动态库。
+
+```text
+-I"$JAVA_HOME/include"
+```
+
+让 C++ 编译器找到 `jni.h`。
+
+```text
+-I"$JAVA_HOME/include/darwin"
+```
+
+让 C++ 编译器找到 macOS 平台相关 JNI 头文件。
+
+```text
+-I"build/generated"
+```
+
+让 C++ 编译器找到刚才生成的 `HelloNative.h`。
+
+输出文件是：
+
+```text
+build/lib/libhello.dylib
+```
+
+---
+
+## 6. 运行 Java
+
+运行时要告诉 JVM 两件事：
+
+第一，Java class 在哪里：
+
+```text
+-cp build/classes
+```
+
+第二，native 动态库在哪里：
+
+```text
+-Djava.library.path=build/lib
+```
+
+完整命令：
+
+```bash
+java -Djava.library.path=build/lib -cp build/classes HelloNative
+```
+
+输出：
+
+```text
+Hello from C++, Java
+```
+
+整个流程是：
+
+```text
+HelloNative.java
+    ↓ javac -h
+HelloNative.class + HelloNative.h
+    ↓ g++ 编译
+libhello.dylib
+    ↓ java 运行时加载
+Java 调 C++ 函数
+```
+
+---
+
+## 7. 基础类型怎么对应？
+
+如果 Java 里有：
+
+```java
+public native int add(int a, int b);
+public native double multiply(double a, double b);
+public native boolean isPositive(int value);
+```
+
+生成的 JNI 类型大概是：
+
+```text
+Java int      -> JNI jint
+Java double   -> JNI jdouble
+Java boolean  -> JNI jboolean
+```
+
+C++ 实现：
+
+```cpp
+#include "PrimitiveNative.h"
+
+extern "C" JNIEXPORT jint JNICALL Java_PrimitiveNative_add(
+    JNIEnv*,
+    jobject,
+    jint a,
+    jint b) {
+  return a + b;
+}
+
+extern "C" JNIEXPORT jdouble JNICALL Java_PrimitiveNative_multiply(
+    JNIEnv*,
+    jobject,
+    jdouble a,
+    jdouble b) {
+  return a * b;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_PrimitiveNative_isPositive(
+    JNIEnv*,
+    jobject,
+    jint value) {
+  return value > 0;
+}
+```
+
+基础类型比较简单，因为它们可以直接作为值传进来。
+
+真正麻烦的是 `String`、数组、对象这些复杂类型，它们需要通过 `JNIEnv*` 操作。
+
+---
+
+## 8. 有包名以后，JNI 函数名会变长
+
+真实项目里一般不会把类放在默认包里，而是会有包名：
+
+```java
+package com.example.nativemath;
+
+public class NativeMath {
+    static {
+        NativeLoader.load();
+    }
+
+    public native int add(int a, int b);
+}
+```
+
+完整类名是：
+
+```text
+com.example.nativemath.NativeMath
+```
+
+对应 JNI 函数名变成：
+
+```cpp
+Java_com_example_nativemath_NativeMath_add
+```
+
+规则是：
+
+```text
+Java_包名_类名_方法名
+```
+
+包名里的点号 `.` 会变成下划线 `_`。
+
+所以：
+
+```text
+com.example.nativemath.NativeMath.add
+```
+
+对应：
+
+```cpp
+Java_com_example_nativemath_NativeMath_add
+```
+
+C++ 实现：
+
+```cpp
+#include "com_example_nativemath_NativeMath.h"
+
+extern "C" JNIEXPORT jint JNICALL Java_com_example_nativemath_NativeMath_add(
+    JNIEnv*,
+    jobject,
+    jint a,
+    jint b) {
+  return a + b;
+}
+```
+
+---
+
+## 9. 先把 Java class 打成 jar
+
+如果只是把 Java class 打进 jar，可以这样：
+
+```bash
+jar --create --file build/jar/nativemath.jar -C build/classes .
+```
+
+这句的意思是：
+
+```text
+进入 build/classes
+把里面所有内容打进 build/jar/nativemath.jar
+```
+
+如果 class 目录里有：
+
+```text
+com/example/nativemath/Demo.class
+com/example/nativemath/NativeLoader.class
+com/example/nativemath/NativeMath.class
+```
+
+那么 jar 里也会有这些路径。
+
+运行：
+
+```bash
+java \
+  -Djava.library.path=build/lib \
+  -cp build/jar/nativemath.jar \
+  com.example.nativemath.Demo
+```
+
+这里：
+
+```text
+-cp build/jar/nativemath.jar
+```
+
+表示 Java class 从 jar 里找。
+
+```text
+-Djava.library.path=build/lib
+```
+
+表示 native 动态库还是从 jar 外面的 `build/lib` 找。
+
+这已经能跑，但还不够像 RocksDB Java。
+
+因为用户还要额外配置 native 库路径。
+
+---
+
+## 10. 把 native 库也放进 jar
+
+更好的方式是把动态库也放进 jar。
+
+比如 jar 内部结构变成：
+
+```text
+com/example/nativemath/Demo.class
+com/example/nativemath/NativeLoader.class
+com/example/nativemath/NativeMath.class
+native/macos-aarch64/libnativemath.dylib
+```
+
+打包时先把动态库复制到资源目录：
+
+```bash
+mkdir -p build/resources/native/macos-aarch64
+cp build/lib/libnativemath.dylib \
+  build/resources/native/macos-aarch64/libnativemath.dylib
+```
+
+然后打 jar：
+
+```bash
+jar --create \
+  --file build/jar/nativemath.jar \
+  -C build/classes . \
+  -C build/resources .
+```
+
+这里有两个 `-C`：
+
+```text
+-C build/classes .
+```
+
+表示把 class 放进去。
+
+```text
+-C build/resources .
+```
+
+表示把资源文件也放进去。
+
+最终 jar 里既有 Java class，也有 native 动态库。
+
+可以这样查看 jar 内容：
+
+```bash
+jar --list --file build/jar/nativemath.jar
+```
+
+或者短写：
+
+```bash
+jar tf build/jar/nativemath.jar
+```
+
+---
+
+## 11. 为什么还要把 native 库复制到临时文件？
+
+既然动态库已经在 jar 里了，为什么不能直接加载？
+
+原因是：
+
+> JVM 不能直接加载 jar 里面的 `.dylib`、`.so`、`.dll`。
+
+jar 本质上是一个压缩包。
+
+在 jar 里的动态库只是一个资源文件，可以用 Java 读成 `InputStream`：
+
+```java
+InputStream in =
+    NativeLoader.class.getResourceAsStream("/native/macos-aarch64/libnativemath.dylib");
+```
+
+但是操作系统加载动态库需要真实文件路径。
+
+`System.load(...)` 需要的是：
+
+```text
+/var/folders/.../nativemath-12345.dylib
+```
+
+它不能加载：
+
+```text
+jar:file:/xxx/nativemath.jar!/native/macos-aarch64/libnativemath.dylib
+```
+
+所以必须先：
+
+```text
+jar 里的 dylib
+    ↓ 读成 InputStream
+复制到临时目录里的真实文件
+    ↓
+System.load(临时文件绝对路径)
+```
+
+这就是 native loader 要做的事。
+
+---
+
+## 12. NativeLoader 是怎么工作的？
+
+一个简化版加载器：
+
+```java
+package com.example.nativemath;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+
+public final class NativeLoader {
+    private static boolean loaded;
+
+    private NativeLoader() {
+    }
+
+    public static synchronized void load() {
+        if (loaded) {
+            return;
+        }
+
+        String resourcePath = nativeResourcePath();
+        String suffix = librarySuffix();
+
+        try (InputStream in = NativeLoader.class.getResourceAsStream(resourcePath)) {
+            if (in == null) {
+                throw new IllegalStateException("Native library not found in jar: " + resourcePath);
+            }
+
+            Path tempFile = Files.createTempFile("nativemath-", suffix);
+            tempFile.toFile().deleteOnExit();
+            Files.copy(in, tempFile, StandardCopyOption.REPLACE_EXISTING);
+
+            System.load(tempFile.toAbsolutePath().toString());
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to load native library: " + resourcePath, e);
+        }
+
+        loaded = true;
+    }
+
+    private static String nativeResourcePath() {
+        return "/native/" + platformName() + "/" + libraryFileName();
+    }
+
+    private static String platformName() {
+        String os = System.getProperty("os.name").toLowerCase();
+        String arch = System.getProperty("os.arch").toLowerCase();
+
+        if (os.contains("mac") && (arch.equals("aarch64") || arch.equals("arm64"))) {
+            return "macos-aarch64";
+        }
+        if (os.contains("linux") && (arch.equals("amd64") || arch.equals("x86_64"))) {
+            return "linux-x86_64";
+        }
+
+        throw new UnsupportedOperationException("Unsupported platform: " + os + "-" + arch);
+    }
+
+    private static String libraryFileName() {
+        String os = System.getProperty("os.name").toLowerCase();
+        if (os.contains("mac")) {
+            return "libnativemath.dylib";
+        }
+        if (os.contains("linux")) {
+            return "libnativemath.so";
+        }
+        throw new UnsupportedOperationException("Unsupported OS: " + os);
+    }
+
+    private static String librarySuffix() {
+        String fileName = libraryFileName();
+        return fileName.substring(fileName.lastIndexOf('.'));
+    }
+}
+```
+
+核心流程是：
+
+```text
+1. 判断是否已经 loaded
+2. 判断当前平台
+3. 拼出 jar 内资源路径
+4. getResourceAsStream 读取 native 库
+5. 创建临时文件
+6. 把 native 库复制到临时文件
+7. System.load 加载临时文件
+8. 标记 loaded = true
+```
+
+这里为什么用：
+
+```java
+System.load(...)
+```
+
+而不是：
+
+```java
+System.loadLibrary(...)
+```
+
+因为 `System.loadLibrary` 是按名字从 `java.library.path` 里找。
+
+而 `System.load` 可以直接加载一个绝对路径。
+
+我们已经把动态库复制到了临时文件，所以应该用：
+
+```java
+System.load(tempFile.toAbsolutePath().toString());
+```
+
+---
+
+## 13. 最终运行方式
+
+打完 jar 后，运行时只需要：
+
+```bash
+java -cp build/jar/nativemath.jar com.example.nativemath.Demo
+```
+
+不再需要：
+
+```bash
+-Djava.library.path=build/lib
+```
+
+因为 native 库已经在 jar 里。
+
+运行时由 `NativeLoader` 自动解压并加载。
+
+完整链路是：
+
+```text
+1. javac 编译 Java，生成 .class 和 JNI .h
+2. g++ 编译 C++，生成 libnativemath.dylib
+3. cp 把 dylib 复制到 build/resources/native/macos-aarch64/
+4. jar 把 class 和 native/ 目录一起打进 nativemath.jar
+5. java -cp nativemath.jar 运行 Demo
+6. NativeMath static 块调用 NativeLoader.load()
+7. NativeLoader 从 jar 里读取 dylib
+8. 复制到临时文件
+9. System.load 加载临时 dylib
+10. Java 调用 C++ add
+```
+
+这就是很多 Java native 库的基本发布方式。
+
+---
+
+## 14. 还需要知道哪些坑？
+
+第一，native 库是分平台的。
+
+一个 jar 想支持多个平台，通常要放多份：
+
+```text
+native/macos-aarch64/libxxx.dylib
+native/macos-x86_64/libxxx.dylib
+native/linux-x86_64/libxxx.so
+native/windows-x86_64/xxx.dll
+```
+
+第二，Java 方法签名变了，C++ 函数名也要跟着变。
+
+最稳的方法是重新执行：
+
+```bash
+javac -h ...
+```
+
+然后照生成的 `.h` 写 C++。
+
+第三，jar 版本和 native 库版本必须匹配。
+
+否则 Java 里声明了 native 方法，但动态库里没有对应实现，就会报：
+
+```text
+UnsatisfiedLinkError
+```
+
+第四，C++ 崩溃会带着 JVM 一起崩。
+
+普通 Java 异常通常还能捕获，但 native 代码里如果出现非法内存访问，可能直接导致 JVM crash。
+
+第五，真实项目一般不会手写这么多命令。
+
+学习时用 Makefile 是为了看清底层流程。
+
+真实项目通常会用：
+
+```text
+CMake
+Gradle
+Maven
+GitHub Actions
+```
+
+处理多平台编译、打包和发布。
+
+---
+
+## 总结
+
+JNI 的主线其实不复杂：
+
+```text
+Java 用 native 声明方法
+javac -h 生成 C++ 头文件
+C++ 按头文件实现 JNI 函数
+编译成动态库
+Java 加载动态库并调用
+```
+
+如果要把它做成像 RocksDB Java 那样的库，核心就是：
+
+```text
+把 Java class 和平台相关 native 库一起打进 jar
+运行时判断平台
+从 jar 里取出对应 native 库
+复制到临时文件
+System.load 加载
+```
+
+理解了这条链路，再看那些带 native 的 Java 库，就不会觉得神秘了。
+
