@@ -1,0 +1,784 @@
+---
+title: "从 Loss 到泛化：机器学习训练到底发生了什么"
+date: "2026-09-10"
+tag: "AI"
+description: "从模型究竟学习什么开始，串起梯度下降、数据集划分、过拟合、分类 Loss、评价指标、矩阵运算与一个从零实现的二分类实验。"
+---
+
+我有比较多的软件工程经验，也做过 Agent Runtime、工具调用和执行系统，但真正开始系统补 AI 算法基础后，我发现最容易出现的问题不是代码不会写，而是很多概念看起来都懂，放到一起却连不起来。
+
+比如：
+
+- 模型到底在学习什么？
+- `loss.backward()` 和参数更新分别做了什么？
+- 为什么训练集 Loss 很低，模型仍然可能很差？
+- Sigmoid、Softmax、BCE、Cross Entropy 分别负责什么？
+- Accuracy 已经很高了，为什么还需要 Precision、Recall 和 F1？
+- 神经网络里的矩阵乘法和链式法则，到底怎样接到训练过程上？
+
+这篇文章记录了我系统补机器学习基础之后，真正建立起来的一条训练主线。我不打算把它写成传统机器学习算法大全，而是只围绕后续理解深度学习、Transformer 和 LLM 最重要的过程展开：
+
+```text
+数据
+  ↓
+模型根据参数产生预测
+  ↓
+Loss 衡量预测有多差
+  ↓
+backward 计算 Loss 对参数的梯度
+  ↓
+参数沿梯度反方向更新
+  ↓
+在验证集上选择模型
+  ↓
+最后在测试集上评价泛化能力
+```
+
+---
+
+## 机器学习真正学习的是参数
+
+先看最简单的线性模型：
+
+```text
+y_hat = w * x + b
+```
+
+这里：
+
+- `x` 是输入；
+- `y_hat` 是模型预测；
+- `w` 和 `b` 是参数。
+
+所谓“训练模型”，并不是让程序凭空理解数据，而是在不断调整 `w` 和 `b`，让模型的预测越来越接近真实答案。
+
+假设数据背后的规律是：
+
+```text
+y = 2 * x + 1
+```
+
+模型一开始可能是：
+
+```text
+y_hat = 0.3 * x - 0.5
+```
+
+它现在显然拟合得不好。训练要做的事情，就是根据样本不断调整参数，最后得到一组接近正确规律的 `w` 和 `b`。
+
+因此，我最先建立起来的一个认识是：
+
+> 机器学习通常不是直接记住一个答案，而是从数据中找到一组能够描述规律的参数。
+
+当然，真实神经网络里的参数不再只有两个，而可能有几十亿甚至更多。但无论模型多复杂，训练的基本问题仍然一样：
+
+```text
+什么样的参数，可以让模型在数据上的表现更好？
+```
+
+---
+
+## Loss 是参数好坏的评分函数
+
+有了预测以后，还需要一种方法判断当前参数到底好不好，这就是 Loss。
+
+以回归问题中的均方误差 MSE 为例：
+
+```text
+MSE = mean((y_hat - y)²)
+```
+
+如果预测接近真实值，Loss 就小；如果差得很远，Loss 就大。
+
+因此可以把训练理解成一个优化问题：
+
+```text
+寻找一组参数，使 Loss 尽可能小。
+```
+
+模型、参数和 Loss 的关系可以概括成：
+
+```text
+参数决定模型如何预测
+预测和真实答案共同决定 Loss
+Loss 评价当前参数的效果
+```
+
+但 Loss 只告诉我们“现在有多差”，没有直接告诉我们参数下一步应该怎么改。这个方向由梯度提供。
+
+---
+
+## 梯度告诉参数往哪里变化
+
+梯度可以理解成：
+
+> Loss 对所有参数的偏导数组成的向量。
+
+如果只有一个参数 `w`，那么只需要看：
+
+```text
+dLoss / dw
+```
+
+如果这个导数是正数，说明在当前位置增大 `w` 会让 Loss 增大，因此应该减小 `w`。
+
+如果导数是负数，说明增大 `w` 会让 Loss 减小，因此应该增大 `w`。
+
+这两种情况统一写成梯度下降：
+
+```text
+parameter = parameter - learning_rate * gradient
+```
+
+为什么要乘学习率？
+
+因为梯度只适合告诉我们局部方向，不适合直接充当参数的变化量。假设当前 `w=1`、梯度是 `-35`，如果直接减去梯度：
+
+```text
+w = 1 - (-35) = 36
+```
+
+这一步可能跨过最低点很远，甚至让 Loss 爆炸。学习率就是每一步的步长：
+
+- 学习率太大，可能来回震荡甚至发散；
+- 学习率太小，下降稳定但训练很慢；
+- 越接近最低点，梯度通常越小，参数更新也会自然变小。
+
+在 PyTorch 中，计算梯度和更新参数是两个不同动作：
+
+```python
+loss.backward()  # 只计算梯度，把结果写入 parameter.grad
+
+with torch.no_grad():
+    parameter -= learning_rate * parameter.grad
+```
+
+一个很常见的误解是：
+
+```text
+loss.backward() 会自动训练模型。
+```
+
+实际上它只负责求梯度。真正改变参数的是后面的更新操作。
+
+---
+
+## Batch GD、SGD 和 Mini-batch SGD
+
+它们的区别，不是 Loss 公式不同，而是每次用多少数据估计梯度。
+
+### Batch Gradient Descent
+
+每次使用整个训练集计算一次梯度：
+
+```text
+全部训练数据 → 一个梯度 → 更新一次参数
+```
+
+梯度稳定，但数据量大时一次更新很慢。
+
+### Stochastic Gradient Descent
+
+严格意义上的 SGD 每次只使用一个样本：
+
+```text
+一个样本 → 一个梯度 → 更新一次参数
+```
+
+更新频繁，但梯度噪声很大。
+
+### Mini-batch SGD
+
+实际深度学习中最常见的是 Mini-batch：
+
+```text
+一小批样本 → 一个平均梯度 → 更新一次参数
+```
+
+它在计算效率和梯度稳定性之间取得平衡，也适合 GPU 的并行计算。
+
+如果训练集有 10 个样本，batch size 是 4，那么一个 epoch 会分成：
+
+```text
+4 + 4 + 2
+```
+
+因此一个 epoch 更新 3 次参数，而不是 10 次，也不是 1 次。
+
+---
+
+## Train、Validation 和 Test 分别负责什么
+
+把全部数据都拿来训练，会产生一个严重问题：我们不知道模型究竟学会了规律，还是只记住了原题。
+
+所以通常把数据分成三部分：
+
+```text
+Train      用于计算梯度、更新参数
+Validation 用于选择超参数和训练轮次
+Test       只在最终确定模型后评价一次
+```
+
+可以把三者类比成：
+
+```text
+训练集：平时练习题
+验证集：模拟考试
+测试集：最终考试
+```
+
+验证集虽然不参与 `backward()`，却会间接影响训练决策。比如我们根据 `val_loss` 选择 epoch、学习率、模型大小或正则化强度，那么验证集实际上已经参与了模型选择。
+
+如果反复根据验证集结果修改方案，最终也可能对验证集过拟合。因此测试集必须尽量保持封闭，只在所有决策完成之后使用。
+
+---
+
+## Supervised 和 Unsupervised 的根本区别
+
+监督学习的数据包含输入和目标：
+
+```text
+(x, y)
+```
+
+同一个输入 `x`，如果标签 `y` 不同，Loss 和梯度也会不同，参数会被推向不同方向。标签实际在告诉模型：
+
+```text
+你应该学成什么样。
+```
+
+无监督学习没有人工标签 `y`，算法需要从输入本身寻找结构。例如聚类会尝试让同一组内的样本更接近、不同组之间更远。
+
+但聚类中的类别数量通常不是算法天然知道的。像 K-Means 中的 `K` 往往需要人工指定，再结合业务含义、轮廓系数或肘部法等方法判断是否合理。
+
+这也说明：
+
+> 算法可以优化一个明确目标，但“应该分成几类”经常仍然是建模选择，而不是数据自动给出的唯一答案。
+
+---
+
+## Underfitting、Overfitting 和 Regularization
+
+### 欠拟合
+
+模型能力不足，连训练数据中的规律都没有学好：
+
+```text
+train loss 高
+validation loss 也高
+```
+
+### 过拟合
+
+模型把训练数据学得过于具体，甚至记住了噪声：
+
+```text
+train loss 很低
+validation loss 开始升高
+```
+
+因此不能只看训练 Loss。训练集告诉我们“原题做得怎么样”，验证集才更能反映“新题做得怎么样”。
+
+一个常用办法是 L2 Regularization：
+
+```text
+objective = data_loss + lambda * sum(parameter²)
+```
+
+它会惩罚过大的参数，让模型倾向于选择更平滑、更简单的规律。
+
+但是 `lambda` 不是越大越好：
+
+- 太小，约束不足，仍可能过拟合；
+- 太大，模型不敢使用足够大的参数，会发生欠拟合。
+
+正则化的本质不是让参数越小越好，而是在拟合数据与控制复杂度之间做权衡。
+
+---
+
+## 回归和分类的输出有什么不同
+
+回归通常预测连续数值：
+
+```text
+房价、温度、时长、收入
+```
+
+模型可以直接输出一个实数，再使用 MSE 等 Loss。
+
+分类预测的是离散类别：
+
+```text
+是否欺诈
+图片属于猫、狗还是鸟
+一句话属于哪种意图
+```
+
+分类模型通常先输出 logits。Logit 不是概率，它只是模型对各类别给出的原始分数。
+
+二分类常见输出 shape：
+
+```text
+logits: [batch_size]
+```
+
+多分类常见输出 shape：
+
+```text
+logits: [batch_size, num_classes]
+```
+
+---
+
+## 二分类：Sigmoid 和 BCE
+
+Sigmoid 把任意实数 logit 转换到 0 和 1 之间：
+
+```text
+sigmoid(z) = 1 / (1 + exp(-z))
+```
+
+它有几个直观性质：
+
+```text
+z > 0  → probability > 0.5
+z = 0  → probability = 0.5
+z < 0  → probability < 0.5
+```
+
+因此默认阈值为 0.5 时：
+
+```text
+sigmoid(logit) >= 0.5
+```
+
+和下面完全等价：
+
+```text
+logit >= 0
+```
+
+二分类交叉熵 BCE 是：
+
+```text
+BCE = -[y * log(p) + (1-y) * log(1-p)]
+```
+
+当 `y=1` 时，只剩：
+
+```text
+-log(p)
+```
+
+当 `y=0` 时，只剩：
+
+```text
+-log(1-p)
+```
+
+所以 BCE 的行为是：
+
+```text
+正确且自信   → Loss 很小
+正确但不自信 → Loss 较大
+错误但不自信 → Loss 较大
+错误且自信   → Loss 非常大
+```
+
+实际训练时应该直接传入 logits：
+
+```python
+loss = F.binary_cross_entropy_with_logits(logits, labels)
+```
+
+不要先手动调用 Sigmoid。融合后的实现可以避免概率趋近 0 或 1 时出现数值精度问题。
+
+BCE 对 logit 的梯度有一个非常漂亮的形式：
+
+```text
+dLoss / dlogit = probability - label
+```
+
+如果真实标签是 1，梯度小于等于 0，梯度下降会提高 logit；如果真实标签是 0，梯度大于等于 0，梯度下降会降低 logit。
+
+---
+
+## 多分类：Softmax 和 Cross Entropy
+
+多分类中，一个样本会得到多个 logits：
+
+```text
+logits = [2, 1, 0]
+```
+
+Softmax 将它们转换成总和为 1 的概率：
+
+```text
+softmax(logits) ≈ [0.665, 0.245, 0.090]
+```
+
+Softmax 更关心 logits 之间的相对差距，而不是绝对大小。因此：
+
+```text
+[2, 1, 0]
+[1002, 1001, 1000]
+```
+
+会得到相同的概率分布。因为所有指数项都多乘了同一个 `exp(1000)`，在分子和分母中可以约掉。
+
+实际实现通常先减去每行最大值：
+
+```python
+shifted_logits = logits - logits.max(dim=1, keepdim=True).values
+probabilities = torch.exp(shifted_logits)
+probabilities /= probabilities.sum(dim=1, keepdim=True)
+```
+
+`keepdim=True` 会把按行聚合后的 shape 保留为：
+
+```text
+[batch_size, 1]
+```
+
+这样每个样本的最大值或分母才能沿类别维度正确广播。
+
+多分类交叉熵的完整形式是：
+
+```text
+Loss = -sum(y_c * log(p_c))
+```
+
+普通单标签分类中的 `y` 是 one-hot。只有真实类别的位置是 1，其他位置都是 0，所以最终只剩：
+
+```text
+Loss = -log(p_true_class)
+```
+
+正确类别的概率越高，Loss 越小；正确类别的概率越低，Loss 越大。
+
+PyTorch 中同样应该直接传 logits：
+
+```python
+loss = F.cross_entropy(logits, labels)
+```
+
+不要先手动 Softmax。`cross_entropy` 会使用数值稳定的方式合并 LogSoftmax 和负对数似然计算。
+
+它对第 `k` 个 logit 的梯度是：
+
+```text
+dLoss / dz_k = p_k - y_k
+```
+
+例如：
+
+```text
+p = [0.7, 0.2, 0.1]
+y = [1.0, 0.0, 0.0]
+
+p - y = [-0.3, 0.2, 0.1]
+```
+
+梯度下降会增大正确类别的 logit，同时压低两个错误类别的 logits。错误类别当前概率越高，受到的向下调整越强。
+
+每个样本的这些梯度相加为 0：
+
+```text
+sum(p - y) = sum(p) - sum(y) = 1 - 1 = 0
+```
+
+这和 Softmax 对公共平移不敏感是同一件事的两个侧面。
+
+---
+
+## 为什么 Accuracy 不够
+
+假设有 100 个样本：
+
+```text
+负类 95 个
+正类  5 个
+```
+
+如果模型把所有样本都预测为负类，它的 Accuracy 仍然有 95%。但如果正类代表疾病、欺诈或系统故障，这个模型一个目标都没有找出来。
+
+二分类需要先统计混淆矩阵：
+
+| 真实情况 | 模型预测 | 名称 | 含义 |
+|---|---|---|---|
+| 正类 | 正类 | TP | 正类预测正确 |
+| 正类 | 负类 | FN | 正类被漏掉 |
+| 负类 | 正类 | FP | 负类被误报 |
+| 负类 | 负类 | TN | 负类预测正确 |
+
+常用指标是：
+
+```text
+Accuracy  = (TP + TN) / (TP + TN + FP + FN)
+Precision = TP / (TP + FP)
+Recall    = TP / (TP + FN)
+F1        = 2 * Precision * Recall / (Precision + Recall)
+```
+
+可以这样记：
+
+```text
+Precision：模型找出来的正类中，有多少是真的
+Recall：   所有真正的正类中，模型找出了多少
+```
+
+降低二分类阈值，模型会预测出更多正类：
+
+- Recall 通常会上升；
+- Precision 通常会下降，但并非数学上必然下降；
+- Accuracy 也不一定如何变化，要看新增的 TP 和 FP 谁更多。
+
+严重疾病的初步筛查更怕漏掉患者，因此通常优先关注 Recall；误报代价特别高的系统则更关注 Precision。
+
+---
+
+## 向量、矩阵和批量计算
+
+一个包含 3 个特征的样本可以写成：
+
+```text
+x: [3]
+```
+
+它是一维向量。一个 batch 中有 4 个样本时：
+
+```text
+X: [4, 3]
+```
+
+它是二维矩阵，表示 4 个样本、每个样本 3 个特征。
+
+单输出线性模型可以批量计算：
+
+```text
+X:     [4, 3]
+w:        [3]
+X @ w: [4]
+```
+
+每个样本与 `w` 做一次点积，因此得到 4 个预测值。
+
+多分类需要每个样本产生多个输出：
+
+```text
+X:      [32, 128]
+W:      [128, 10]
+b:           [10]
+logits: [32, 10]
+```
+
+矩阵乘法最重要的 shape 规则是：
+
+```text
+[m, n] @ [n, p] -> [m, p]
+```
+
+中间两个 `n` 必须相同，因为点积需要把 `n` 个元素一一配对、相乘并求和。
+
+单个输出元素可以写成：
+
+```text
+logits[i, c] = sum(X[i, d] * W[d, c]) + b[c]
+```
+
+后续学习 Linear Layer、Attention 和 Transformer 时，几乎所有 shape 推导都建立在这个规则上。
+
+---
+
+## 链式法则就是 backward 的数学基础
+
+考虑一条计算链：
+
+```text
+w -> z = xw -> Loss = z²
+```
+
+`w` 先影响 `z`，`z` 再影响 Loss，因此：
+
+```text
+dLoss/dw = dLoss/dz * dz/dw
+```
+
+简单公式当然可以先展开再直接求导。但真实神经网络由大量算子组成，不可能人工展开成一个总公式。
+
+Autograd 的做法是：
+
+```text
+前向时记录计算图
+反向时从 Loss 出发
+计算每一步的局部梯度
+沿同一条路径相乘
+在多条路径汇合处相加
+最终写入叶子参数的 .grad
+```
+
+例如同一个参数走两条路径：
+
+```text
+       ┌-> a = 2w -> loss_a = a² ┐
+w -----|                          |-> loss = loss_a + loss_b
+       └-> b = 3w -> loss_b = b² ┘
+```
+
+那么：
+
+```text
+dLoss/dw = dLoss_a/dw + dLoss_b/dw
+```
+
+这也解释了为什么共享参数被多次使用时，梯度贡献必须汇总。
+
+PyTorch 默认会累加 `.grad`，所以每次参数更新之后，还要在下一次 `backward()` 前清空旧梯度：
+
+```python
+w.grad.zero_()
+b.grad.zero_()
+```
+
+使用优化器时，对应的是：
+
+```python
+optimizer.zero_grad()
+```
+
+---
+
+## 最终实验：从零训练一个二分类模型
+
+最后我用一个二维线性可分数据集，把前面的概念串起来。
+
+数据由一条隐藏直线生成：
+
+```python
+torch.manual_seed(42)
+
+features = torch.randn(120, 2)
+teacher_w = torch.tensor([2.0, -3.0])
+teacher_b = torch.tensor(0.5)
+
+teacher_logits = features @ teacher_w + teacher_b
+labels = (teacher_logits >= 0).to(torch.float32)
+```
+
+其中：
+
+```text
+features: [120, 2]
+labels:   [120]
+```
+
+然后随机划分为：
+
+```text
+Train:      80
+Validation: 20
+Test:       20
+```
+
+模型参数从 0 开始：
+
+```python
+w = torch.zeros(2, requires_grad=True)
+b = torch.zeros((), requires_grad=True)
+```
+
+这里 `b.shape == []`，表示它是一个包含单个数值的零维 Tensor，而不是空 Tensor。
+
+核心训练循环没有使用高级训练框架：
+
+```python
+for epoch in range(1, num_epochs + 1):
+    train_logits = X_train @ w + b
+    train_loss = F.binary_cross_entropy_with_logits(
+        train_logits,
+        y_train,
+    )
+
+    train_loss.backward()
+
+    with torch.no_grad():
+        w -= learning_rate * w.grad
+        b -= learning_rate * b.grad
+
+    w.grad.zero_()
+    b.grad.zero_()
+```
+
+每轮更新后，只用验证集做前向计算：
+
+```python
+with torch.no_grad():
+    val_logits = X_val @ w + b
+    val_loss = F.binary_cross_entropy_with_logits(
+        val_logits,
+        y_val,
+    )
+```
+
+如果验证 Loss 更低，就复制并保存当前参数。等所有训练和参数选择结束后，才第一次使用测试集。
+
+训练 300 个 epoch 后，结果是：
+
+```text
+初始训练 Loss：0.6931
+最终训练 Loss：0.1873
+
+学习到的 w：[1.9186, -2.6134]
+隐藏规律的 w：[2.0000, -3.0000]
+```
+
+参数不需要与生成数据的参数完全相同，仍然可以产生非常接近的分类边界。分类只关心样本落在边界哪一侧，而不是参数必须恢复成唯一数值。
+
+最终测试结果：
+
+```text
+Accuracy  = 0.950
+Precision = 1.000
+Recall    = 0.857
+F1        = 0.923
+
+TP=6, FN=1, FP=0, TN=13
+```
+
+也就是说，测试集上没有误报，但漏掉了一个正类。
+
+这个实验很小，却完整走过了机器学习训练的核心链路：
+
+```mermaid
+flowchart LR
+    A[准备并划分数据] --> B[矩阵乘法得到 logits]
+    B --> C[BCE 计算 Loss]
+    C --> D[backward 计算梯度]
+    D --> E[梯度下降更新参数]
+    E --> B
+    E --> F[Validation 选择参数]
+    F --> G[Test 最终评价]
+```
+
+---
+
+## 学完这部分基础后，我真正理解了什么
+
+这一阶段不要求记住大量传统机器学习算法。真正需要建立的是下面这套心智模型：
+
+```text
+模型是一个带参数的函数
+训练是在数据上寻找更好的参数
+Loss 把预测效果变成可优化的数值
+梯度指出 Loss 上升最快的方向
+梯度下降沿反方向更新参数
+训练集用于学习，验证集用于选择，测试集用于最终评价
+训练 Loss 低不等于泛化好
+分类模型输出 logits，Loss 内部完成稳定的概率计算
+评价分类模型不能只看 Accuracy
+矩阵乘法负责批量前向，链式法则负责反向传播
+```
+
+如果能够从直觉、公式、Tensor shape 和代码四个角度解释这条链路，后面学习神经元、Linear Layer、激活函数、计算图和完整神经网络时，就不再是一堆互不相关的新名词。
+
+再往后学习神经元、Linear Layer 和深度神经网络，本质上都是在这套训练框架里，把简单线性模型替换成多层、非线性的模型。
