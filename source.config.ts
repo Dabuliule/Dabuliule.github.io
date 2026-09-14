@@ -9,6 +9,7 @@ export const docs = defineDocs({
   docs: {
     schema: pageSchema.extend({
       date: pageSchema.shape.title.optional(),
+      order: pageSchema.shape.title.optional(),
       tag: pageSchema.shape.title.optional(),
     }),
     postprocess: {

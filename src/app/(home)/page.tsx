@@ -1,183 +1,104 @@
 import Link from 'next/link';
 import { source } from '@/lib/source';
-import { ArrowUpRight, CalendarDays, FileText, Tags, UserRound } from 'lucide-react';
-
-type Page = (typeof source)['$inferPage'];
+import { ArrowRight, ArrowUpRight } from 'lucide-react';
 
 const dateFormatter = new Intl.DateTimeFormat('zh-CN', {
-  year: 'numeric',
-  month: '2-digit',
-  day: '2-digit',
+  year: 'numeric', month: '2-digit', day: '2-digit', timeZone: 'UTC',
 });
 
-function formatDate(date?: string) {
-  if (!date) return null;
-
-  const value = new Date(date);
-  if (Number.isNaN(value.getTime())) return date;
-
-  return dateFormatter.format(value);
-}
-
-function getPageTime(page: Page) {
-  if (!page.data.date) return 0;
-
-  const time = new Date(page.data.date).getTime();
+function getTime(date?: string) {
+  const time = date ? Date.parse(date) : 0;
   return Number.isNaN(time) ? 0 : time;
 }
 
-function ArticleCard({ page, featured = false }: { page: Page; featured?: boolean }) {
-  const date = formatDate(page.data.date);
-
-  return (
-    <Link
-      href={page.url}
-      className="group rounded-lg border bg-fd-card p-5 transition-colors hover:bg-fd-accent"
-    >
-      <div className="mb-4 flex flex-wrap items-center gap-2 text-xs text-fd-muted-foreground">
-        {page.data.tag ? (
-          <span className="rounded-md bg-fd-muted px-2 py-1 font-medium">{page.data.tag}</span>
-        ) : null}
-        {date ? (
-          <span className="inline-flex items-center gap-1">
-            <CalendarDays className="size-3.5" aria-hidden="true" />
-            {date}
-          </span>
-        ) : null}
-      </div>
-      <div className="flex items-start justify-between gap-4">
-        <h3 className={`${featured ? 'text-xl' : 'text-lg'} font-semibold leading-snug`}>
-          {page.data.title}
-        </h3>
-        <ArrowUpRight
-          className={`${featured ? 'size-5' : 'size-4'} mt-1 shrink-0 text-fd-muted-foreground transition-colors group-hover:text-fd-foreground`}
-          aria-hidden="true"
-        />
-      </div>
-      {page.data.description ? (
-        <p className="mt-3 max-w-3xl text-sm leading-6 text-fd-muted-foreground">
-          {page.data.description}
-        </p>
-      ) : null}
-    </Link>
-  );
-}
-
 export default function HomePage() {
-  const pages = source
-    .getPages()
-    .filter((page) => page.url !== '/docs')
-    .sort((a, b) => getPageTime(b) - getPageTime(a));
-  const tagGroups = Array.from(
-    pages.reduce((groups, page) => {
-      const tag = page.data.tag;
-      if (!tag) return groups;
-
-      const group = groups.get(tag) ?? [];
-      group.push(page);
-      groups.set(tag, group);
-
-      return groups;
-    }, new Map<string, Page[]>()),
-  ).map(([tag, groupPages]) => ({ tag, pages: groupPages }));
-  const latestPage = pages[0];
+  const pages = source.getPages().filter((page) => page.url !== '/docs').sort((a, b) =>
+    getTime(b.data.date) - getTime(a.data.date) ||
+    Number(b.data.order ?? 0) - Number(a.data.order ?? 0) ||
+    a.url.localeCompare(b.url),
+  );
+  const tags = Array.from(new Set(pages.map((page) => page.data.tag ?? '其他')));
+  const series = pages.filter((page) => page.data.tag === 'AI').sort((a, b) =>
+    Number(a.data.order ?? 0) - Number(b.data.order ?? 0),
+  );
 
   return (
-    <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col px-6 py-12 sm:py-16">
-      <div className="mb-4 flex justify-end">
-        <Link
-          href="/docs"
-          className="inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm font-medium text-fd-muted-foreground transition-colors hover:bg-fd-accent hover:text-fd-foreground"
-        >
-          <UserRound className="size-4" aria-hidden="true" />
-          关于我
-        </Link>
-      </div>
-
-      <section className="grid gap-3 border-b pb-8 sm:grid-cols-2">
-        <div className="rounded-lg border bg-fd-card p-4">
-          <div className="flex items-center gap-2 text-sm text-fd-muted-foreground">
-            <FileText className="size-4" aria-hidden="true" />
-            文章
-          </div>
-          <div className="mt-2 text-2xl font-semibold">{pages.length}</div>
+    <main className="mx-auto w-full max-w-5xl flex-1 px-5 py-10 sm:px-8 sm:py-16">
+      <header className="border-b pb-8 sm:pb-10">
+        <p className="mb-3 text-sm font-medium text-fd-muted-foreground">学习 · 实践 · 记录</p>
+        <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">代码札记</h1>
+        <p className="mt-4 max-w-2xl text-base leading-7 text-fd-muted-foreground">
+          记录 AI、Agent Runtime 与后端工程中的学习和实践，把技术背后的原理一步步讲清楚。
+        </p>
+        <div className="mt-6 flex flex-wrap items-center gap-x-5 gap-y-3 text-sm">
+          <a href="#articles" className="inline-flex items-center gap-2 rounded-lg bg-fd-primary px-4 py-2.5 font-medium text-fd-primary-foreground hover:opacity-85">
+            浏览文章 <ArrowRight className="size-4" aria-hidden="true" />
+          </a>
+          <Link href="/docs" className="text-fd-muted-foreground hover:text-fd-foreground">关于我 ↗</Link>
+          <span className="text-fd-muted-foreground">{pages.length} 篇文章 · {tags.length} 个分类</span>
         </div>
-        <div className="rounded-lg border bg-fd-card p-4">
-          <div className="flex items-center gap-2 text-sm text-fd-muted-foreground">
-            <Tags className="size-4" aria-hidden="true" />
-            Tag
+      </header>
+
+      {series.length > 0 && (
+        <section aria-labelledby="series-title" className="border-b py-8">
+          <div className="mb-4 flex flex-wrap items-baseline justify-between gap-2">
+            <h2 id="series-title" className="text-lg font-semibold">AI 基础 · 系列阅读</h2>
+            <p className="text-xs text-fd-muted-foreground">从基础到实践，按顺序阅读</p>
           </div>
-          <div className="mt-2 flex flex-wrap gap-2">
-            {tagGroups.map((group) => (
-              <span
-                key={group.tag}
-                className="rounded-md bg-fd-muted px-2 py-1 text-xs font-medium"
-              >
-                {group.tag} · {group.pages.length}
-              </span>
+          <ol className="grid gap-3 md:grid-cols-3">
+            {series.map((page, index) => (
+              <li key={page.url} className="flex">
+                <Link href={page.url} className="group flex w-full gap-3 rounded-xl border bg-fd-card p-4 transition-colors hover:bg-fd-accent">
+                  <span className="pt-0.5 text-xs font-medium tabular-nums text-fd-muted-foreground">{String(index + 1).padStart(2, '0')}</span>
+                  <h3 className="text-sm font-medium leading-6">{page.data.title}</h3>
+                </Link>
+              </li>
             ))}
-          </div>
-        </div>
-      </section>
-
-      {latestPage ? (
-        <section className="grid gap-4 border-b py-8 md:grid-cols-[180px_1fr]">
-          <div>
-            <h2 className="text-sm font-semibold uppercase tracking-normal text-fd-muted-foreground">
-              最新文章
-            </h2>
-          </div>
-          <ArticleCard page={latestPage} featured />
+          </ol>
         </section>
-      ) : null}
+      )}
 
-      <section className="grid gap-4 border-b py-8 md:grid-cols-[180px_1fr]">
-        <div>
-          <h2 className="text-sm font-semibold uppercase tracking-normal text-fd-muted-foreground">
-            分类浏览
-          </h2>
+      <section id="articles" aria-labelledby="articles-title" className="scroll-mt-24 pt-8">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <h2 id="articles-title" className="text-xl font-semibold">全部文章</h2>
+          <p className="text-xs text-fd-muted-foreground">按发布时间，由新到旧</p>
         </div>
-        <div className="grid gap-3 md:grid-cols-2">
-          {tagGroups.map((group) => (
-            <section key={group.tag} className="rounded-lg border bg-fd-card p-4">
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <h3 className="font-semibold">{group.tag}</h3>
-                <span className="rounded-md bg-fd-muted px-2 py-1 text-xs font-medium text-fd-muted-foreground">
-                  {group.pages.length} 篇
-                </span>
-              </div>
-              <div className="grid gap-2">
-                {group.pages.map((page) => (
-                  <Link
-                    key={page.url}
-                    href={page.url}
-                    className="group flex items-start justify-between gap-3 rounded-md px-2 py-1.5 transition-colors hover:bg-fd-accent"
-                  >
-                    <span className="text-sm leading-6 group-hover:text-fd-foreground">
-                      {page.data.title}
-                    </span>
-                    {page.data.date ? (
-                      <span className="shrink-0 text-xs leading-6 text-fd-muted-foreground">
-                        {formatDate(page.data.date)}
-                      </span>
-                    ) : null}
-                  </Link>
-                ))}
-              </div>
-            </section>
+        <style>{`
+          #articles:not(:has(.category-target:target)) [data-tag="all"] {
+            background: var(--color-fd-primary); color: var(--color-fd-primary-foreground);
+          }
+          ${tags.map((_, index) => `
+            #articles:has(#category-${index}:target) .article-row:not([data-category="${index}"]) { display: none; }
+            #articles:has(#category-${index}:target) [data-tag="${index}"] {
+              background: var(--color-fd-primary); color: var(--color-fd-primary-foreground);
+            }
+          `).join('')}
+        `}</style>
+        <nav aria-label="按分类筛选文章" className="my-5 flex flex-wrap gap-2">
+          <a href="#articles" className="article-filter rounded-full border px-3 py-1.5 text-xs" data-tag="all">全部 {pages.length}</a>
+          {tags.map((tag, index) => (
+            <a key={tag} href={`#category-${index}`} className="article-filter rounded-full border px-3 py-1.5 text-xs text-fd-muted-foreground hover:bg-fd-accent" data-tag={index}>
+              {tag} <span className="ml-1 tabular-nums">{pages.filter((page) => (page.data.tag ?? '其他') === tag).length}</span>
+            </a>
           ))}
-        </div>
-      </section>
-
-      <section className="grid gap-4 py-8 md:grid-cols-[180px_1fr]">
-        <div>
-          <h2 className="text-sm font-semibold uppercase tracking-normal text-fd-muted-foreground">
-            归档
-          </h2>
-        </div>
-        <div className="grid gap-3">
-          {pages.map((page) => (
-            <ArticleCard key={page.url} page={page} />
+        </nav>
+        {tags.map((tag, index) => <span key={tag} id={`category-${index}`} className="category-target scroll-mt-40" />)}
+        <div className="article-list border-t">
+          {pages.map((page, index) => (
+            <article key={page.url} data-category={tags.indexOf(page.data.tag ?? '其他')} className="article-row border-b">
+              <Link href={page.url} className="group grid gap-3 rounded-lg py-6 transition-colors hover:bg-fd-muted/50 sm:grid-cols-[100px_minmax(0,1fr)_20px] sm:gap-6 sm:px-3">
+                <div className="flex items-center gap-2 text-xs leading-6 text-fd-muted-foreground sm:block">
+                  {page.data.date ? <time dateTime={page.data.date} className="tabular-nums">{dateFormatter.format(getTime(page.data.date))}</time> : <span>日期待补充</span>}
+                  {index === 0 && <span className="inline-block rounded bg-fd-muted px-2 text-fd-foreground sm:mt-2">最新</span>}
+                </div>
+                <div className="min-w-0">
+                  <h3 className="text-base font-semibold leading-7 sm:text-lg">{page.data.title}</h3>
+                  {page.data.description && <p className="mt-2 line-clamp-2 text-sm leading-6 text-fd-muted-foreground">{page.data.description}</p>}
+                  <span className="mt-3 inline-block text-xs text-fd-muted-foreground">{page.data.tag ?? '其他'}</span>
+                </div>
+                <ArrowUpRight className="mt-1 hidden size-4 text-fd-muted-foreground group-hover:text-fd-foreground sm:block" aria-hidden="true" />
+              </Link>
+            </article>
           ))}
         </div>
       </section>
