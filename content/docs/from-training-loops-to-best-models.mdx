@@ -21,6 +21,12 @@ description: "在手写神经网络之后，继续理解 Module 的参数注册�
 
 本文依次说明这些职责，再将它们组合成“训练 → 验证 → 保存 → 恢复 → 测试”的流程。
 
+## 符号约定
+
+沿用前两篇的记法：**标量**写作 $x,\eta$，**向量**写作 $\mathbf{x},\boldsymbol{\theta}$，**矩阵**写作 $\mathbf{X},\mathbf{W}$。优化器公式中的 $\boldsymbol{\theta}$ 是展平后的参数向量，$\mathbf{g}_t$ 是第 $t$ 步梯度，$\eta$ 是学习率。
+
+$\odot$ 表示**逐元素乘法**；向量的平方、平方根和除法也按元素计算。它们与矩阵乘法不同，下面会分别标明。
+
 ## Module 管理参数，但不会替模型定义计算
 
 手写版本需要显式创建 `W1、b1、W2、b2`，并维护参数列表。`nn.Module` 通过参数注册统一管理这些对象，使优化器能够遍历模型参数。
@@ -57,8 +63,8 @@ self.layer1 = nn.Linear(2, 3)
 
 | 实现 | 权重 shape | 计算 |
 | --- | --- | --- |
-| 前文手写 | [2, 3] | X @ W + b |
-| nn.Linear(2, 3) | [3, 2] | X @ weight.T + bias |
+| 前文手写 | $\mathbf{W}\in\mathbb{R}^{2\times3}$ | `X @ W + b` |
+| `nn.Linear(2, 3)` | $\mathbf{W}_{\mathrm{Linear}}\in\mathbb{R}^{3\times2}$ | `X @ weight.T + bias` |
 
 输入仍是 `[B, 2]`，输出仍是 `[B, 3]`。核对两种实现时，应将手写的 `W.T` 复制到 `nn.Linear.weight`，并复制相同偏置。两者表达的是同一个仿射变换，区别在于权重的存储布局。
 
@@ -88,9 +94,9 @@ for X_batch, y_batch in loader:
 
 记录指标也需要考虑 batch 大小。假设三个 batch 的平均 Loss 是 `L1、L2、L3`，按样本平均应该计算：
 
-```text
-平均 Loss = (2 * L1 + 2 * L2 + L3) / 5
-```
+$$
+L_{\mathrm{epoch}}=\frac{2L_1+2L_2+L_3}{5}
+$$
 
 直接除以三，会让最后那个样本获得过大的权重。
 
@@ -108,15 +114,20 @@ for X_batch, y_batch in loader:
 | loss.backward() | 计算并累加参数梯度 |
 | optimizer.step() | 根据梯度更新参数 |
 
-`eval()` 不会关闭计算图，`no_grad()` 不会关闭 Dropout。对于只有 Linear 和 ReLU 的模型，模式切换暂时不改变前向规则；加入 Dropout 后，这个区别就能直接观察到。
+**`eval()` 不会关闭计算图，`no_grad()` 不会关闭 Dropout。**对于只有 Linear 和 ReLU 的模型，模式切换暂时不改变前向规则；加入 Dropout 后，这个区别就能直接观察到。
 
-训练时，Dropout 以概率 p 将每个激活元素置零，保留下来的值除以 `1-p`。例如输入为 3、p 为 0.2：
+训练时，**Dropout** 以概率 $p$ 将每个激活元素置零，保留下来的值除以 $1-p$。用掩码向量表示为：
 
-```text
-20% 概率输出 0
-80% 概率输出 3 / 0.8 = 3.75
-期望值 = 0.2 * 0 + 0.8 * 3.75 = 3
-```
+$$
+m_j\sim\operatorname{Bernoulli}(1-p),\qquad
+\tilde{\mathbf{x}}=\frac{\mathbf{m}\odot\mathbf{x}}{1-p},\qquad 0\leq p<1
+$$
+
+这里 $m_j$ 是第 $j$ 个元素的掩码，取值为 0 或 1；$\mathbf{m}$ 只表示 Dropout 掩码，与后文 Adam 的历史统计无关。例如输入为 3、p 为 0.2：
+
+$$
+\tilde{x}=\begin{cases}0,&\text{概率 }0.2\\3/0.8=3.75,&\text{概率 }0.8\end{cases}\qquad\mathbb{E}[\tilde{x}]=0.2\times0+0.8\times3.75=3
+$$
 
 这保持的是期望，不保证每次刚好丢掉指定比例的元素。例如对 16 个全 1 元素使用 `p=0.5`，输出元素为 0 或 2，但零的数量不一定恰好是 8。
 
@@ -126,7 +137,18 @@ Dropout 没有可训练参数。它通过训练时随机遮掉部分特征，减
 
 ## LayerNorm：样本统计与可训练参数要分开
 
-LayerNorm 解决的是另一类问题：调整隐藏特征的数值尺度。对 `[B, D]` 输入使用 `nn.LayerNorm(D)`，每个样本独立沿最后一个特征维计算均值和方差。
+**LayerNorm** 调整隐藏特征的数值尺度。对 $\mathbf{X}\in\mathbb{R}^{B\times D}$ 使用 `nn.LayerNorm(D)`，每个样本独立沿最后一个特征维计算均值和方差：
+
+$$
+\mu_i=\frac1D\sum_{j=1}^{D}X_{ij},\qquad
+\sigma_i^2=\frac1D\sum_{j=1}^{D}(X_{ij}-\mu_i)^2
+$$
+
+$$
+\tilde{X}_{ij}=\frac{X_{ij}-\mu_i}{\sqrt{\sigma_i^2+\varepsilon}}
+$$
+
+$i$ 是样本索引，$j$ 是特征索引。$\varepsilon>0$ 用于数值稳定，对应代码中的 `eps`：
 
 ```python
 mean = X.mean(dim=-1, keepdim=True)                 # [B, 1]
@@ -138,21 +160,19 @@ normalized = (X - mean) / torch.sqrt(variance + eps) # [B, D]
 
 在 gamma 为 1、beta 为 0，且 eps 很小时，三行输入的结果近似为：
 
-```text
-[ 1,  2,  3] → [-1.2247, 0, 1.2247]
-[10, 20, 30] → [-1.2247, 0, 1.2247]
-[ 5,  5,  5] → [ 0,      0, 0     ]
-```
+$$
+\begin{bmatrix}1&2&3\\10&20&30\\5&5&5\end{bmatrix}\quad\longrightarrow\quad\begin{bmatrix}-1.2247&0&1.2247\\-1.2247&0&1.2247\\0&0&0\end{bmatrix}
+$$
 
 前两行的偏差和标准差按相同比例变化，尺度基本抵消；因为 eps 存在，它们不是严格完全相同。第三行没有特征差异，减均值后全为零。标准化不会凭空产生差异，也不能笼统地说所有输出的方差都一定为 1。
 
 完整 LayerNorm 还包含可学习的逐元素缩放和平移：
 
-```text
-Y = normalized * gamma + beta
-```
+$$
+\mathbf{y}_i=\tilde{\mathbf{x}}_i\odot\boldsymbol{\gamma}+\boldsymbol{\beta}
+$$
 
-对于 `nn.LayerNorm(3)`，gamma 和 beta 的 shape 都是 `[3]`，默认分别初始化为全 1 和全 0。它们对应 `.weight` 和 `.bias`，共六个参数元素。
+这里 $\tilde{\mathbf{x}}_i$ 是标准化后的第 $i$ 个样本。对于 `nn.LayerNorm(3)`，$\boldsymbol{\gamma},\boldsymbol{\beta}\in\mathbb{R}^{3}$，代码中的 shape 都是 `[3]`，默认分别初始化为全 1 和全 0。它们对应 `.weight` 和 `.bias`，共六个参数元素。
 
 必须区分两类量：均值和方差由每个样本即时计算；gamma 和 beta 跨样本共享，由训练学习。batch 从 3 增加到 100，参数量仍然是六个。
 
@@ -164,35 +184,31 @@ Y = normalized * gamma + beta
 
 先看无阻尼、无 Nesterov 的 SGD 动量：
 
-```text
-v_t = momentum * v_(t-1) + g_t
-parameter -= learning_rate * v_t
-```
+$$
+\begin{aligned}\mathbf{u}_t&=\mu\mathbf{u}_{t-1}+\mathbf{g}_t\\\boldsymbol{\theta}_t&=\boldsymbol{\theta}_{t-1}-\eta\mathbf{u}_t\end{aligned}
+$$
 
 使用梯度序列 `[2, -1, 2, -1]`、动量系数 0.9 时，动量依次为 `[2, 0.8, 2.72, 1.448]`。第二步当前梯度已经为负，动量仍为正，因此更新还保持之前的方向。
 
-Adam 则保存两组指数移动平均。下面的 v 表示梯度平方的平均，含义与上面的 SGD 动量不同：
+上式中 $\mu$ 是动量系数，$\mathbf{u}_t$ 是累计动量，$\mathbf{u}_0=\mathbf{0}$。**Adam** 则保存两组指数移动平均，初始值均为零：
 
-```text
-m_t = beta1 * m_(t-1) + (1 - beta1) * g_t
-v_t = beta2 * v_(t-1) + (1 - beta2) * g_t²
-```
+$$
+\begin{aligned}\mathbf{m}_t&=\beta_1\mathbf{m}_{t-1}+(1-\beta_1)\mathbf{g}_t\\\mathbf{v}_t&=\beta_2\mathbf{v}_{t-1}+(1-\beta_2)(\mathbf{g}_t\odot\mathbf{g}_t)\end{aligned}
+$$
 
-m 综合历史梯度方向，v 记录平方尺度，避免正负梯度互相抵消。v 不是方差，因为这里没有先减去梯度均值。
+$\mathbf{m}_t$ 综合历史梯度方向，$\mathbf{v}_t$ 记录梯度的平方尺度，避免正负梯度互相抵消。**二阶原点矩不是方差**：这里没有先减去梯度均值。$\beta_1$ 和 $\beta_2$ 控制两组历史统计的衰减速度。
 
 从零初始化会让早期平均值偏小。假设梯度始终为 2，beta1 为 0.9，前两步 m 为 0.2 和 0.38。第二步实际梯度的权重之和只有 `0.09 + 0.1 = 0.19`，所以用 `0.38 / 0.19` 得到修正后的 2。
 
 一般形式为：
 
-```text
-m_hat = m_t / (1 - beta1**t)
-v_hat = v_t / (1 - beta2**t)
-parameter -= learning_rate * m_hat / (sqrt(v_hat) + eps)
-```
+$$
+\begin{aligned}\hat{\mathbf{m}}_t&=\frac{\mathbf{m}_t}{1-\beta_1^t},\qquad\hat{\mathbf{v}}_t=\frac{\mathbf{v}_t}{1-\beta_2^t}\\\boldsymbol{\theta}_t&=\boldsymbol{\theta}_{t-1}-\eta\frac{\hat{\mathbf{m}}_t}{\sqrt{\hat{\mathbf{v}}_t}+\varepsilon}\end{aligned}
+$$
 
 偏差修正处理零初始化的影响，不会抹去历史平滑，也不代表结果等于当前梯度。梯度序列 `[2, 4, -1, 3]` 对应的修正一阶平均约为 `[2, 3.0526, 1.5572, 1.9767]`。
 
-所有运算逐元素进行。若参数是 `[32, 16]`，其梯度、m 和 v 也都是 `[32, 16]`，每个参数元素维护自己的尺度。
+**上式中的除法和平方根都逐元素进行，不涉及矩阵求逆。** 公式用展平向量表示全部参数；实现中若某个参数 Tensor 是 `[32, 16]`，它的梯度和两组历史统计也都是 `[32, 16]`，每个参数元素维护自己的尺度。
 
 还可以用成比例的梯度检查自适应缩放：若两组梯度历史始终相差十倍，使用相同超参数并从零初始化历史统计，忽略 eps 的影响时，两组自适应更新量相同。原因是：分子的 m_hat 放大十倍，分母的平方根也放大十倍，基本抵消。这依赖整个梯度历史成固定比例，不意味着任意两个参数的更新量都相同。
 
@@ -200,16 +216,28 @@ parameter -= learning_rate * m_hat / (sqrt(v_hat) + eps)
 
 ## AdamW 把参数衰减从历史统计里分离出来
 
-在普通无动量 SGD 中，给 Loss 加上 `lambda / 2 * sum(parameter²)`，会给梯度增加 `lambda * parameter`。代入更新式，可以整理为先按比例缩小参数，再应用任务梯度更新。
+在普通无动量 SGD 中，加入 **L2 惩罚项**后：
+
+$$
+J(\boldsymbol{\theta})=L(\boldsymbol{\theta})+\frac{\lambda}{2}\lVert\boldsymbol{\theta}\rVert_2^2,\qquad
+\nabla J=\nabla L+\lambda\boldsymbol{\theta}
+$$
+
+这里采用 $\lambda/2$ 的系数，使惩罚项的梯度恰好为 $\lambda\boldsymbol{\theta}$。代入 SGD 更新式：
+
+$$
+\boldsymbol{\theta}_t=(1-\eta\lambda)\boldsymbol{\theta}_{t-1}-\eta\mathbf{g}_t
+$$
+
+其中 $\mathbf{g}_t$ 是任务损失的梯度。因此，在这个条件下，L2 惩罚等价于先按比例缩小参数，再应用任务梯度更新。
 
 但 Adam 会对输入梯度计算历史平均和自适应缩放，L2 项也会跟着进入这些处理，所以通常不再等价于直接按比例缩小参数。
 
-AdamW 的做法是：m、v 只接收任务梯度，参数衰减单独执行。
+**AdamW 将权重衰减与自适应梯度更新分开**：$\mathbf{m}_t$、$\mathbf{v}_t$ 只接收任务梯度，权重衰减系数 $\lambda$ 单独作用于参数。
 
-```text
-parameter_new = (1 - learning_rate * weight_decay) * parameter_old
-                - learning_rate * m_hat / (sqrt(v_hat) + eps)
-```
+$$
+\boldsymbol{\theta}_t=(1-\eta\lambda)\boldsymbol{\theta}_{t-1}-\eta\frac{\hat{\mathbf{m}}_t}{\sqrt{\hat{\mathbf{v}}_t}+\varepsilon}
+$$
 
 实验中，一个参数初始为 2，任务梯度为 -0.1，学习率为 0.01，衰减系数为 0.1。只看第一次更新并忽略很小的 eps：
 
@@ -249,7 +277,7 @@ AdamW 的结果增大，并不说明衰减没有生效。衰减确实减小了�
 best_state = model.state_dict()
 ```
 
-并不能保证得到独立快照。`state_dict()` 返回的映射包含对模型参数和持久缓冲区的引用，后续训练可能让其中的数值一起变化。
+**不能保证得到独立快照。**`state_dict()` 返回的映射包含对模型参数和持久缓冲区的引用，后续训练可能让其中的数值一起变化。
 
 正确的内存快照方式是：
 
@@ -332,11 +360,9 @@ test_loss, test_accuracy, confusion = evaluate(restored_model, test_loader)
 
 测试混淆矩阵的行表示真实类别，列表示预测类别：
 
-```text
-[[29,  0,  1],
- [ 1, 29,  0],
- [ 5,  1, 24]]
-```
+$$
+\mathbf{C}=\begin{bmatrix}29&0&1\\1&29&0\\5&1&24\end{bmatrix}
+$$
 
 主要错误来自类别 2：30 个样本中有 6 个被错分，其中 5 个分成了类别 0。它的召回率为 80%，低于另两类约 96.7% 的召回率。Macro-F1 是各类别 F1 的算术平均，给每个类别相同权重。
 

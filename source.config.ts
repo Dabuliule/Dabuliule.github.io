@@ -1,5 +1,7 @@
 import { defineConfig, defineDocs } from 'fumadocs-mdx/config';
 import { metaSchema, pageSchema } from 'fumadocs-core/source/schema';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
 import { remarkMdxMermaid } from 'fumadocs-core/mdx-plugins';
 
 // You can customize Zod schemas for frontmatter and `meta.json` here
@@ -23,6 +25,8 @@ export const docs = defineDocs({
 
 export default defineConfig({
   mdxOptions: {
-    remarkPlugins: [remarkMdxMermaid],
+    remarkPlugins: [remarkMdxMermaid, remarkMath],
+    // Render math before the default code highlighter sees language-math nodes.
+    rehypePlugins: (plugins) => [rehypeKatex, ...plugins],
   },
 });

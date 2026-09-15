@@ -18,23 +18,40 @@ description: "从 X @ W + b 出发，理解为什么叠加线性层还不够，R
 
 本文直接使用 PyTorch Tensor 实现一个两层网络：先标注前向计算的 shape，再用标量例子推导梯度，最后给出可运行的批量训练代码。参数创建、更新和梯度清零都显式写出，便于与后续的 `nn.Module` 和优化器对应。
 
+## 符号与维度
+
+本文用 $x,w$ 等普通斜体表示**标量**，用 $\mathbf{x},\mathbf{b}$ 等粗体小写表示**向量**，用 $\mathbf{X},\mathbf{W}$ 等粗体大写表示**矩阵**。$B$ 表示 batch 大小，$D$ 表示输入维度，$H$ 表示隐藏维度，$O$ 表示输出维度。
+
+数学中的向量默认是列向量，数据矩阵的每一行对应一个样本。代码采用 `X @ W + b` 的权重布局，偏置通过广播加到每一行；公式会将广播显式写出。
+
 ## 线性层：同一份输入，计算多个加权组合
 
 之前的线性模型只有一个输出：
 
-```text
-z = x1 * w1 + x2 * w2 + b
-```
+$$
+z=x_1w_1+x_2w_2+b=\mathbf{x}^{\mathsf T}\mathbf{w}+b
+$$
 
 如果希望两个输入特征产生三个输出，就为每个输出准备一组独立的权重和偏置：
 
-```text
-z1 = x1 * w11 + x2 * w21 + b1
-z2 = x1 * w12 + x2 * w22 + b2
-z3 = x1 * w13 + x2 * w23 + b3
-```
+$$
+\begin{aligned}z_1&=x_1w_{11}+x_2w_{21}+b_1\\z_2&=x_1w_{12}+x_2w_{22}+b_2\\z_3&=x_1w_{13}+x_2w_{23}+b_3\end{aligned}
+$$
 
-把每组权重放在矩阵的一列，就能合并成：
+把每组权重放在矩阵的一列：
+
+$$
+\mathbf{W}=\begin{bmatrix}w_{11}&w_{12}&w_{13}\\w_{21}&w_{22}&w_{23}\end{bmatrix}\in\mathbb{R}^{2\times3},\qquad
+\mathbf{b}=\begin{bmatrix}b_1\\b_2\\b_3\end{bmatrix}\in\mathbb{R}^{3}
+$$
+
+对一批输入，三个输出可以同时计算：
+
+$$
+\mathbf{Z}=\mathbf{X}\mathbf{W}+\mathbf{1}_B\mathbf{b}^{\mathsf T}
+$$
+
+$\mathbf{1}_B$ 是长度为 $B$ 的全 1 向量，$\mathbf{1}_B\mathbf{b}^{\mathsf T}$ 将偏置重复到每一行。对应代码为：
 
 ```python
 Z = X @ W + b
@@ -74,10 +91,9 @@ Z = X @ W + b
 
 先把两个线性层接起来：
 
-```text
-H = XW1 + b1
-Y = HW2 + b2
-```
+$$
+\begin{aligned}\mathbf{H}&=\mathbf{X}\mathbf{W}_1+\mathbf{1}_B\mathbf{b}_1^{\mathsf T}\\\mathbf{Y}&=\mathbf{H}\mathbf{W}_2+\mathbf{1}_B\mathbf{b}_2^{\mathsf T}\end{aligned}
+$$
 
 假设输入、隐藏特征和输出分别是：
 
@@ -91,11 +107,9 @@ Y:  [4, 1]
 
 代入并展开第二个式子：
 
-```text
-Y = (XW1 + b1)W2 + b2
-  = XW1W2 + b1W2 + b2
-  = X(W1W2) + (b1W2 + b2)
-```
+$$
+\begin{aligned}\mathbf{Y}&=(\mathbf{X}\mathbf{W}_1+\mathbf{1}_B\mathbf{b}_1^{\mathsf T})\mathbf{W}_2+\mathbf{1}_B\mathbf{b}_2^{\mathsf T}\\&=\mathbf{X}(\mathbf{W}_1\mathbf{W}_2)+\mathbf{1}_B(\mathbf{b}_1^{\mathsf T}\mathbf{W}_2+\mathbf{b}_2^{\mathsf T})\end{aligned}
+$$
 
 于是可以定义：
 
@@ -109,7 +123,7 @@ Y = X @ W_merged + b_merged
 
 合并后的参数不依赖具体输入，意味着两种写法对任意兼容输入都等价。继续叠加第三层，也可以用同样的方法合并。
 
-> 只叠加线性层，最终仍然只能表达一个仿射变换。层数增加，并没有因此获得表达非线性关系的能力。
+> **只叠加线性层，最终仍然只能表达一个仿射变换。** 增加层数本身不能引入非线性。
 
 这说的是可表达的函数形式。不同分解方式仍可能影响优化过程，隐藏维度还可能限制等效权重的秩，但这些都不会把纯线性层组合变成非线性函数。
 
@@ -117,16 +131,15 @@ Y = X @ W_merged + b_merged
 
 ReLU 的规则只有一条：
 
-```text
-ReLU(z) = max(0, z)
-```
+$$
+\operatorname{ReLU}(z)=\max(0,z)
+$$
 
 它逐元素把负数变成零，非负数保持不变：
 
-```text
-输入：[-2, 0, 3]
-输出：[ 0, 0, 3]
-```
+$$
+\operatorname{ReLU}\!\left(\begin{bmatrix}-2\\0\\3\end{bmatrix}\right)=\begin{bmatrix}0\\0\\3\end{bmatrix}
+$$
 
 为什么它不能用同一个 `w * x + b` 表示？如果匹配 `x=0` 和 `x=1` 的 ReLU 输出，就必须有 `b=0`、`w=1`。此时输入 `x=-1`，线性模型输出 -1，ReLU 却输出 0。
 
@@ -138,14 +151,23 @@ A = torch.relu(H)  # [batch_size, 3]
 Y = A @ W2 + b2  # [batch_size, 1]
 ```
 
-shape 没变，但中间特征的值可能改变。比如某个样本的 `H` 是 `[5, 2, -3]`，激活后就是 `[5, 2, 0]`。
+写成矩阵形式为：
 
-若第二层权重为 `[2, -1, 1]`，偏置为 0.5：
+$$
+\begin{aligned}
+\mathbf{H}&=\mathbf{X}\mathbf{W}_1+\mathbf{1}_B\mathbf{b}_1^{\mathsf T}\\
+\mathbf{A}&=\operatorname{ReLU}(\mathbf{H})\\
+\hat{\mathbf{Y}}&=\mathbf{A}\mathbf{W}_2+\mathbf{1}_B\mathbf{b}_2^{\mathsf T}
+\end{aligned}
+$$
 
-```text
-没有 ReLU：5 * 2 - 2 - 3 + 0.5 = 5.5
-加入 ReLU：5 * 2 - 2 + 0 + 0.5 = 8.5
-```
+其中 ReLU **逐元素作用于矩阵**。shape 没变，但中间特征的值可能改变。比如某个样本的 `H` 是 `[5, 2, -3]`，激活后就是 `[5, 2, 0]`。
+
+若第二层权重向量为 $\mathbf{w}_2=[2,-1,1]^{\mathsf T}$，偏置为 $0.5$：
+
+$$
+\begin{aligned}\hat{y}_{\text{无激活}}&=5\times2-2-3+0.5=5.5\\\hat{y}_{\text{ReLU}}&=5\times2-2+0+0.5=8.5\end{aligned}
+$$
 
 ReLU 没有可训练参数，改变的是不同输入下参与后续计算的特征。网络一般不能再按之前的公式合并成一个线性层。不过，特定参数或限定输入范围下仍可能退化为线性关系；加了 ReLU 并不保证所有情况下都会表现出非线性。
 
@@ -153,12 +175,9 @@ ReLU 没有可训练参数，改变的是不同输入下参与后续计算的特
 
 为了把求导过程看清楚，先缩成没有偏置、只有一个隐藏单元的网络。所有变量都是标量，shape 为 `[]`：
 
-```text
-h = x * w1
- a = ReLU(h)
-prediction = a * w2
-L = 0.5 * (prediction - target)²
-```
+$$
+\begin{aligned}h&=xw_1,\qquad a=\operatorname{ReLU}(h)\\\hat{y}&=aw_2\\\ell&=\frac12(\hat{y}-y)^2\end{aligned}
+$$
 
 前面的 0.5 用于抵消平方求导产生的系数 2。这里的 Loss 是一半的平方误差，和直接使用 MSE 的数值相差一倍。
 
@@ -170,24 +189,23 @@ ReLU 的局部导数可以直接从函数规则理解：
 
 `w1` 影响 Loss 的路径是：
 
-```text
-w1 → h → a → prediction → L
-```
+$$
+w_1\longrightarrow h\longrightarrow a\longrightarrow\hat{y}\longrightarrow\ell
+$$
 
 链式法则要求沿途的局部导数相乘：
 
-```text
-dL/dw1 = (dL/dprediction) * (dprediction/da) * (da/dh) * (dh/dw1)
-```
+$$
+\frac{\partial\ell}{\partial w_1}=\frac{\partial\ell}{\partial\hat{y}}\frac{\partial\hat{y}}{\partial a}\frac{\partial a}{\partial h}\frac{\partial h}{\partial w_1}
+$$
 
 逐项看：
 
-```text
-dL/dprediction = prediction - target
-dprediction/da = w2
-da/dh          = 1 if h > 0 else 0
-dh/dw1         = x
-```
+$$
+\begin{aligned}\frac{\partial\ell}{\partial\hat{y}}&=\hat{y}-y,&\frac{\partial\hat{y}}{\partial a}&=w_2\\\frac{\partial a}{\partial h}&=\mathbf{1}_{h>0},&\frac{\partial h}{\partial w_1}&=x\end{aligned}
+$$
+
+$\mathbf{1}_{h>0}$ 是**指示函数**：条件成立取 1，否则取 0；这里得到的是标量，不是全 1 向量。$\hat{y}$ 和 $y$ 分别对应代码中的 `prediction` 和 `target`。
 
 因此手算梯度可以写为：
 
@@ -199,16 +217,13 @@ manual_dw2 = dloss_dprediction * a
 manual_dw1 = dloss_dprediction * w2 * da_dh * x
 ```
 
-最后的 `x` 来自 `dh/dw1`，不能省略。若只计算前三项，得到的是 `dL/dh`；继续乘以 `x`，才得到需要用于更新 `w1` 的梯度。
+最后的 $x$ 来自 $\partial h/\partial w_1$，不能省略。若只计算前三项，得到的是 $\partial\ell/\partial h$；继续乘以 $x$，才得到需要用于更新 $w_1$ 的梯度。
 
 当 `x=2`、`w1=1`、`w2=3`、目标为 1 时：
 
-```text
-h = 2，a = 2，prediction = 6
-
-dL/dw2 = 5 * 2 = 10
-dL/dw1 = 5 * 3 * 1 * 2 = 30
-```
+$$
+\begin{aligned}h&=2,\quad a=2,\quad\hat{y}=6\\\frac{\partial\ell}{\partial w_2}&=(6-1)\times2=10\\\frac{\partial\ell}{\partial w_1}&=(6-1)\times3\times1\times2=30\end{aligned}
+$$
 
 这两个手算结果可以用来核对 `loss.backward()` 得到的 `w1.grad` 和 `w2.grad`。Autograd 沿计算图执行链式法则并写入梯度，参数更新是之后的独立步骤。
 
@@ -240,17 +255,15 @@ with torch.no_grad():
 
 用刚才的参数做一次更新，学习率取 0.01：
 
-```text
-w1：1.0 - 0.01 * 30 = 0.7
-w2：3.0 - 0.01 * 10 = 2.9
-```
+$$
+\begin{aligned}w_1^{\mathrm{new}}&=1-0.01\times30=0.7\\w_2^{\mathrm{new}}&=3-0.01\times10=2.9\end{aligned}
+$$
 
 重新计算预测和 Loss：
 
-```text
-prediction = ReLU(2 * 0.7) * 2.9 = 4.06
-Loss = 0.5 * (4.06 - 1)² = 4.6818
-```
+$$
+\begin{aligned}\hat{y}&=\operatorname{ReLU}(2\times0.7)\times2.9=4.06\\\ell&=\tfrac12(4.06-1)^2=4.6818\end{aligned}
+$$
 
 相比更新前的 12.5，Loss 下降了。接着把这个过程重复 100 次，并让两个学习率都从相同参数开始，得到：
 
@@ -261,17 +274,14 @@ Loss = 0.5 * (4.06 - 1)² = 4.6818
 
 较大的学习率第一步反而更好，但随后停住了。原因是第一次更新就把 `w1` 变成了 -2：
 
-```text
-h = 2 * (-2) = -4
-a = ReLU(-4) = 0
-```
+$$
+h=2\times(-2)=-4,\qquad a=\operatorname{ReLU}(-4)=0
+$$
 
 于是：
 
-```text
-w1 的梯度为 0：链式法则中乘上了 ReLU 的零导数。
-w2 的梯度为 0：prediction 对 w2 的导数是 a，而 a=0。
-```
+- **$w_1$ 的梯度为零**：链式法则中乘上了 ReLU 的零导数。
+- **$w_2$ 的梯度也为零**：$\partial\hat{y}/\partial w_2=a$，而此时 $a=0$。
 
 参数不再变化，同一个输入产生的 `h` 就一直为负。再训练一千步也无法离开这个状态。
 
@@ -300,11 +310,11 @@ loss.backward()
 
 对应的是：
 
-```text
-L = (L1 + L2 + L3 + L4) / 4
-```
+$$
+L=\frac14\sum_{i=1}^{4}\ell_i=\frac14\sum_{i=1}^{4}\frac12(\hat{y}_i-y_i)^2
+$$
 
-每个参数的梯度也是各样本损失梯度的平均。它已经汇总了样本贡献，因此梯度 shape 与参数一致，不额外保留 batch 维度：
+每个参数的梯度也是各样本损失梯度的平均。它已经汇总了样本贡献，因此**梯度 shape 与参数一致，不额外保留 batch 维度**：
 
 | 参数 | 参数 shape | 梯度 shape |
 | --- | --- | --- |
@@ -315,9 +325,9 @@ L = (L1 + L2 + L3 + L4) / 4
 
 例如，输出偏置加到每个样本的预测上，预测对偏置的导数都是 1。所以在这个损失定义下：
 
-```text
-dL/db2 = mean(predictions - targets)
-```
+$$
+\frac{\partial L}{\partial b_2}=\frac{1}{B}\sum_{i=1}^{B}(\hat{y}_i-y_i)
+$$
 
 以下方完整代码的初始参数为例，四个预测误差是 `[6.5, 6.5, 0.5, 0.5]`，平均为 3.5，因此第一次反向传播应得到 `b2.grad = 3.5`。
 
@@ -331,7 +341,7 @@ targets:        [4] → 对齐为 [1, 4]
 
 结果的第 i 行、第 j 列成了 `prediction_i - target_j`，即每个预测都和所有目标相减。程序仍然可以求平均、反向传播，却已经在优化错误的目标。
 
-因此，本例在计算损失前直接检查：
+**广播成功不等于计算正确。** 本例在计算损失前直接检查：
 
 ```python
 assert predictions.shape == targets.shape
@@ -413,7 +423,7 @@ epoch=300  train_loss=0.005396
 | -1 | -1.0515 |
 | 0 | 0.2006 |
 
-网络已经较好地拟合这四个训练样本，但还没有完全拟合，尤其第四个样本仍有明显误差。本实验没有验证集和测试集，因此不能据此说明泛化能力。
+网络已经较好地拟合这四个训练样本，但还没有完全拟合，尤其第四个样本仍有明显误差。**本实验没有验证集和测试集，不能据此说明泛化能力。**
 
 这个实验的价值是把训练的每一环都实际执行了一遍：矩阵参数产生预测，标量 Loss 汇总样本误差，反向传播计算共享参数的梯度，再用这些梯度修改参数。
 
