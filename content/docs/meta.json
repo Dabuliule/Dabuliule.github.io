@@ -5,6 +5,7 @@
     "from-loss-to-generalization",
     "from-linear-layers-to-neural-networks",
     "from-training-loops-to-best-models",
+    "from-tokens-to-transformer-generation",
     "---Agent Runtime---",
     "agent-runtime-planner",
     "eventbus_in_agent_runtime",

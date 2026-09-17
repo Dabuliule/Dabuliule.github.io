@@ -1,0 +1,571 @@
+---
+title: "从 Token 到文本生成：手写 Transformer 的计算与训练"
+date: "2026-09-17"
+tag: "AI"
+order: "4"
+description: "从 Embedding 和序列状态出发，串起 Q/K/V、多头注意力、位置编码、掩码与 Transformer Block，并通过一次交叉熵维度错误和循环序列实验，理解 next-token 训练与自回归生成。"
+---
+
+前三篇文章分别讨论了[训练与泛化](/docs/from-loss-to-generalization)、[神经网络的前向与反向计算](/docs/from-linear-layers-to-neural-networks)，以及[训练状态和最佳模型选择](/docs/from-training-loops-to-best-models)。有了这些基础，接下来可以把输入从固定长度的数值特征，换成一串 token。
+
+这次我从字符切分、Embedding、RNN 和 LSTM 开始，逐步写到一个支持因果注意力的简化 Transformer，最后训练它预测下一个 token，并用模型自己的预测继续生成。
+
+实现过程中最值得记录的，不只是 Attention 公式，还有几个容易被 shape 掩盖的问题：同一个参数被多次查表时，梯度怎样累加；拆头后直接 reshape 为什么会混淆位置；交叉熵为什么能在没有报错的情况下优化错误目标。
+
+本文沿着“文本如何变成表示、位置之间如何交换信息、训练目标如何对应输出”的顺序展开。梯度下降、优化器和验证选参沿用前文，不再重新介绍。
+
+## 符号与维度约定
+
+标量使用普通斜体，向量使用粗体小写，矩阵使用粗体大写。公式中单个向量采用列向量约定；数据矩阵每一行存放一个位置的表示，代码用右乘权重的形式。偏置在代码中通过广播相加。
+
+| 符号 | 含义 |
+| --- | --- |
+| $B$ | batch 中的序列数量 |
+| $L$ | 序列长度 |
+| $D$ | 模型特征维度 |
+| $N_h$ | 注意力头数 |
+| $d_k,d_v$ | 单个头的 Query/Key 维度、Value 维度 |
+| $N_{\mathrm{vocab}}$ | 词表大小，避免与 Value 矩阵 $\mathbf{V}$ 混淆 |
+
+$\odot$ 表示逐元素乘法，矩阵乘法对应代码中的 `@`。涉及高维 Tensor 时直接标注 shape，矩阵公式通常省略 batch 维。
+
+## 从 token 到向量：编号不包含语义
+
+Tokenization 决定文本怎样切成基本单位，词表再把这些单位映射为整数。token 不一定对应一个汉字或英文单词。
+
+```text
+字符切分："我爱AI！" → ["我", "爱", "A", "I", "！"]
+词表编码：            → [1, 2, 5, 6, 7]
+```
+
+这些 ID 只负责查表。ID 为 6 的 token 不比 ID 为 2 的 token 更重要，编号差值也不是语义距离。如果未知字符统一编码为 `<unk>`，原字符的信息就会丢失，解码无法恢复。
+
+Embedding 则为每个 ID 提供一个可学习向量：
+
+$$
+\mathbf{E}\in\mathbb{R}^{N_{\mathrm{vocab}}\times D}
+$$
+
+```python
+embedding = nn.Embedding(vocab_size, d_model)
+X = embedding(input_ids)
+```
+
+```text
+input_ids: [B, L]，整数索引
+weight:    [N_vocab, D]，浮点参数
+X:         [B, L, D]，按索引取出的向量
+```
+
+它不是把整数 ID 乘上某个向量，而是取出对应行。训练改变表中的浮点数，不改变 ID 的含义，因此词表映射必须与模型参数匹配。
+
+### 重复 token 的梯度会回到同一行
+
+假设“我”对应向量中的两个参数 $a,b$，“爱”对应 $c,d$。输入“我爱我”后，把查出的所有元素相加作为观察用目标：
+
+$$
+\mathcal{L}=a+b+c+d+a+b=2a+2b+c+d
+$$
+
+于是“我”这一行的梯度是 `[2, 2]`，“爱”这一行是 `[1, 1]`。每个参数分别拥有梯度，不会把一行两个元素的梯度合并成一个数。
+
+PyTorch 在前向索引操作中保留了取行关系。反向传播时，来自多个位置的贡献按索引累加回原参数表，所以 `embedding.weight.grad` 与参数表 shape 相同。真实任务里，每次使用的梯度贡献由后续计算决定，不一定都是 1。
+
+## RNN 与 LSTM：沿时间传递什么
+
+Embedding 查表本身不参考上下文。同一个 token 在两个位置查出的向量相同。RNN 增加隐藏状态，让前面的计算影响后面的位置：
+
+$$
+\mathbf{h}_t=\tanh\left(\mathbf{W}_x^{\mathsf T}\mathbf{x}_t+\mathbf{W}_h^{\mathsf T}\mathbf{h}_{t-1}+\mathbf{b}\right)
+$$
+
+对应批量行向量写法：
+
+```python
+h = torch.tanh(x_t @ W_x + h_prev @ W_h + b)
+```
+
+```text
+x_t:    [B, D]    W_x: [D, H]
+h_prev: [B, H]    W_h: [H, H]
+h:      [B, H]
+```
+
+所有时间步复用参数，但每条序列有自己的状态。序列增长不会增加这组参数的数量，却会增加计算步骤；后一步依赖前一步，不能把时间步当作独立样本同时计算。
+
+梯度也沿着时间路径传播。用一个标量简化模型：
+
+$$
+h_t=0.5h_{t-1}\quad\Longrightarrow\quad
+\frac{\partial h_T}{\partial h_0}=0.5^T
+$$
+
+早期状态的影响随着步数增加而变弱。这是长路径导数连乘导致梯度消失的直观例子，并不意味着所有 RNN 状态都趋近零，也不意味着所有参数的梯度都同时消失。
+
+### LSTM 的两份状态不能混为一谈
+
+LSTM 使用细胞状态 $\mathbf{c}_t$ 和隐藏状态 $\mathbf{h}_t$。设每个分支 $r$ 的线性结果为：
+
+$$
+\mathbf{a}_{r,t}=\mathbf{W}_{xr}^{\mathsf T}\mathbf{x}_t+
+\mathbf{W}_{hr}^{\mathsf T}\mathbf{h}_{t-1}+\mathbf{b}_r,
+\qquad r\in\{f,i,g,o\}
+$$
+
+标准无 peephole LSTM 的单步计算是：
+
+$$
+\begin{aligned}
+\mathbf{f}_t&=\sigma(\mathbf{a}_{f,t}), &
+\mathbf{i}_t&=\sigma(\mathbf{a}_{i,t}),\\
+\mathbf{g}_t&=\tanh(\mathbf{a}_{g,t}), &
+\mathbf{o}_t&=\sigma(\mathbf{a}_{o,t}),\\
+\mathbf{c}_t&=\mathbf{f}_t\odot\mathbf{c}_{t-1}+\mathbf{i}_t\odot\mathbf{g}_t,\\
+\mathbf{h}_t&=\mathbf{o}_t\odot\tanh(\mathbf{c}_t).
+\end{aligned}
+$$
+
+| 量 | 作用 |
+| --- | --- |
+| 遗忘门 $\mathbf{f}_t$ | 控制旧细胞状态保留多少 |
+| 输入门 $\mathbf{i}_t$ | 控制候选内容写入多少 |
+| 候选内容 $\mathbf{g}_t$ | 提供本次准备写入的内容 |
+| 细胞状态 $\mathbf{c}_t$ | 保存并传递更新后的内部记忆 |
+| 输出门 $\mathbf{o}_t$ | 控制当前隐藏表示输出多少 |
+| 隐藏状态 $\mathbf{h}_t$ | 参与下一步门值计算，也供后续网络使用 |
+
+这些门和状态的批量 shape 均为 `[B, H]`。门是计算结果，优化器更新的是生成门值的权重和偏置。
+
+细胞状态不只用于生成当前隐藏状态，还会直接传给下一步。只传 `h` 而把 `c` 清零，会切断细胞状态的直接记忆路径；遗忘门仍然存在，但只能乘上零。隐藏状态保留的前文信息则仍可能影响后续计算。
+
+固定遗忘门为 $f$、不写入新内容时，细胞状态路径上的梯度是 $f^T$。20 步实验中，`f=0.5` 时约为 `0.00000095`，`f=0.99` 时约为 `0.818`。这解释了保留门有助于维持信息，但固定小于 1 的比例经过足够多步仍会衰减。完整 LSTM 的门与状态有更多依赖路径，不能把这个简化连乘当成其全部梯度。
+
+## Attention：根据查询汇总多个位置
+
+Attention 允许一个查询直接访问多个位置的表示。Query 表示当前查询，Key 用来计算匹配分数，Value 提供实际汇总的内容。
+
+对一个查询 $\mathbf{q}$：
+
+$$
+s_j=\mathbf{q}^{\mathsf T}\mathbf{k}_j,\qquad
+\alpha_j=\frac{e^{s_j}}{\sum_m e^{s_m}},\qquad
+\mathbf{o}=\sum_j\alpha_j\mathbf{v}_j
+$$
+
+例如三个 Value 为 `[1, 0]`、`[0, 2]`、`[3, 1]`，权重为 `0.2、0.3、0.5`，得到：
+
+$$
+\mathbf{o}=0.2\begin{bmatrix}1\\0\end{bmatrix}
++0.3\begin{bmatrix}0\\2\end{bmatrix}
++0.5\begin{bmatrix}3\\1\end{bmatrix}
+=\begin{bmatrix}1.7\\1.1\end{bmatrix}
+$$
+
+Key 与 Value 的职责不同：Key 参与“参考多少”的计算，Value 决定“汇总什么”。点积同时受到方向和向量长度影响，不能直接解释成语义相似度百分比。
+
+将多个查询按行放进矩阵，就得到：
+
+$$
+\mathbf{A}=\operatorname{softmax}_{\mathrm{row}}\left(
+\frac{\mathbf{Q}\mathbf{K}^{\mathsf T}}{\sqrt{d_k}}\right),\qquad
+\mathbf{O}=\mathbf{A}\mathbf{V}
+$$
+
+```text
+Q:       [Nq, d_k]
+K:       [Nk, d_k]
+V:       [Nk, d_v]
+scores:  [Nq, Nk]
+weights: [Nq, Nk]，每行之和为 1
+output:  [Nq, d_v]
+```
+
+行对应 Query，列对应 Key，Softmax 应沿 Key 维计算。固定 K、V 时，各 Query 独立计算；增加一个 Query 不会改变已有查询的输出。
+
+### 为什么除以根号下的维度
+
+假设 Query、Key 的元素独立、均值为 0、方差为 1，每个乘积的方差为 1。点积有 $d_k$ 项，独立项的方差相加：
+
+$$
+\operatorname{Var}(s)=d_k,\qquad
+\operatorname{Std}(s)=\sqrt{d_k}
+$$
+
+所以除以 $\sqrt{d_k}$ 可以将分数的标准差调回约 1。这里不是说每个分数都会随维度变大，而是分布的波动幅度会增大。实际训练后的 Q、K 不一定严格满足这些假设。
+
+随机向量实验中得到：
+
+| $d_k$ | 原始分数标准差 | 缩放后标准差 | 原始平均最大权重 | 缩放后平均最大权重 |
+| --- | ---: | ---: | ---: | ---: |
+| 4 | 2.142 | 1.071 | 0.353 | 0.162 |
+| 64 | 8.019 | 1.002 | 0.820 | 0.165 |
+| 256 | 16.014 | 1.001 | 0.918 | 0.165 |
+
+分数差距过大时，Softmax 容易接近独占某个位置的分布，其局部梯度可能很小。缩放控制这种由维度带来的变化。除以正数不改变排序，但会改变分数差距，从而改变权重的集中程度。缩放应放在 Softmax 之前。
+
+## Self-Attention 与 Cross-Attention 的区别在输入来源
+
+Self-Attention 从同一条序列生成三种表示：
+
+$$
+\mathbf{Q}=\mathbf{X}\mathbf{W}_Q,\qquad
+\mathbf{K}=\mathbf{X}\mathbf{W}_K,\qquad
+\mathbf{V}=\mathbf{X}\mathbf{W}_V
+$$
+
+三组参数独立，因此 Q 和 K 不必相等。“Self”不表示只关注自身，而是查询和被查询内容来自同一序列。
+
+改变某个位置的输入，会改变它的 Key 和 Value，进而可能影响其他位置的输出。这与“固定 K、V，只新增 Query”的实验条件不同。
+
+Cross-Attention 则让 Q 来自目标侧表示，K、V 来自另一条源序列的表示。例如翻译时，解码器查询编码器的输出：
+
+```text
+目标侧: [B, Lt, D] → Q
+源序列: [B, Ls, D] → K、V
+权重:   [B, Lt, Ls]
+输出:   [B, Lt, d_v]
+```
+
+输出长度跟随查询数量，权重不一定是方阵。若源句已完整给出，不需要按目标位置索引对源句施加三角因果屏蔽，但仍需屏蔽源句 padding。
+
+## 多头注意力：不同投影与正确的元素排列
+
+每个头都读取完整输入，使用自己的投影参数计算 Attention：
+
+$$
+\mathbf{O}=\operatorname{Concat}(\mathbf{head}_0,\ldots,\mathbf{head}_{N_h-1})\mathbf{W}_O
+$$
+
+不同的头有能力学习不同的匹配与汇总方式，但随机初始化下权重不同，并不能证明已经学到明确的语义分工。
+
+实现时，可以用一个大线性层同时生成所有头的特征，再拆分投影结果。不是把原始输入维度切开后分别交给不同头。
+
+```python
+# projected: [B, L, D]，D = num_heads * head_dim
+heads = projected.reshape(B, L, num_heads, head_dim).transpose(1, 2)
+# heads: [B, num_heads, L, head_dim]
+```
+
+### shape 正确，不代表元素归属正确
+
+一个样本的投影结果为：
+
+```text
+位置 0：[0, 1, 2, 3]
+位置 1：[4, 5, 6, 7]
+位置 2：[8, 9, 10, 11]
+```
+
+拆成两个头后，应得到：
+
+```text
+头 0：[[0, 1], [4, 5], [8, 9]]
+头 1：[[2, 3], [6, 7], [10, 11]]
+```
+
+合并时必须先交换回时间维，再合并特征维：
+
+```python
+joined = heads.transpose(1, 2).reshape(B, L, D)
+```
+
+如果直接 `heads.reshape(B, L, D)`，第一行会变成 `[0, 1, 4, 5]`，把另一个位置的内容混了进来。`reshape` 重新分组，`transpose` 交换轴，二者不能相互替代。
+
+### 带 batch 的完整计算
+
+```python
+scores = Q @ K.transpose(-2, -1) / math.sqrt(head_dim)
+weights = torch.softmax(scores, dim=-1)
+heads = weights @ V
+joined = heads.transpose(1, 2).reshape(B, L, D)
+output = out_proj(joined)
+```
+
+```text
+Q/K/V:  [B, N_heads, L, head_dim]
+scores: [B, N_heads, L, L]
+heads:  [B, N_heads, L, head_dim]
+output: [B, L, D]
+```
+
+矩阵乘法发生在最后两维，前面的 batch 与头维分别独立处理。缩放使用单头的维度，不是整个模型维度。多维 Tensor 应显式交换最后两维，不能继续沿用二维矩阵的 `.T`。
+
+固定 $D$、采用四个无偏置的 `Linear(D, D)` 时，参数量为 $4D^2$，改变头数不会改变它。但每个头的宽度、注意力矩阵数量和中间内存占用会变化。
+
+## 位置信息与掩码解决不同问题
+
+### 位置编码告诉模型“在哪里”
+
+不含位置编码、没有 mask 的 Self-Attention 具有置换等变性：交换输入位置，输出也只做同样的交换。它可以依据内容匹配，却无法仅靠这些计算识别 token 的绝对位置。
+
+加入位置向量：
+
+$$
+\mathbf{Z}=\mathbf{X}+\mathbf{P}
+$$
+
+可学习方案用 `nn.Embedding(max_len, D)` 查表。token 从索引 0 移到索引 2，应使用位置 2 的向量；位置向量不跟着 token 一起移动。
+
+固定的正弦位置编码则使用：
+
+$$
+\begin{aligned}
+PE(pos,2i)&=\sin\left(\frac{pos}{10000^{2i/D}}\right),\\
+PE(pos,2i+1)&=\cos\left(\frac{pos}{10000^{2i/D}}\right).
+\end{aligned}
+$$
+
+每一对维度共享分母，用变化快慢不同的周期信号表示位置。$D=4$ 时，一行就是：
+
+$$
+[\sin(pos),\cos(pos),\sin(pos/100),\cos(pos/100)]
+$$
+
+`pos=0` 得到 `[0, 1, 0, 1]`，不是全零。生成的 `[L, D]` 编码可以广播到 `[B, L, D]`，相加不会增加模型维度。公式能生成更远位置的向量，不代表模型一定能在超出训练长度后保持表现。
+
+### 因果掩码规定“不能看未来”
+
+预测下一个 token 时，位置 $i$ 只能读取 $j\leq i$ 的位置。将未来分数设为负无穷后再 Softmax：
+
+```python
+mask = torch.ones(L, L, dtype=torch.bool, device=X.device).triu(diagonal=1)
+scores = scores.masked_fill(mask, float("-inf"))
+weights = torch.softmax(scores, dim=-1)
+```
+
+本段代码约定 `True` 表示禁止访问。不同 API 的布尔 mask 约定未必一致，不能只凭变量名判断。
+
+由于 $e^{-\infty}=0$，未来位置的权重变成零。把分数填成 0 则没有这个效果，因为 $e^0=1$。对角线允许访问，因为当前位置的输入是已知前文的一部分，它的输出用于预测下一位置。
+
+### Padding Mask 屏蔽补齐的 Key 列
+
+两条序列补齐后可能是：
+
+```text
+[1, 2, 3, 4]
+[5, 6, 0, 0]  # 约定 0 是 PAD
+```
+
+多头分数是 `[B, N_heads, L, L]`，padding mask 只需扩展为 `[B, 1, 1, L]`：
+
+```python
+key_mask = (input_ids == pad_id)[:, None, None, :]
+scores = scores.masked_fill(key_mask, float("-inf"))
+```
+
+它广播到每个头、每个 Query，屏蔽对应 Key 列。Padding Query 的输出不会自动归零，逐 token 训练和评价时还要忽略这些位置的目标。
+
+如果一行分数全部变成负无穷，直接 Softmax 会产生 NaN。样本为空、左 padding 与因果 mask 组合等情况需要单独处理，不能假设屏蔽越多越安全。本次综合实验使用等长、无 padding 的序列，因此只需要因果掩码。
+
+## 把组件组装成 Transformer Block
+
+Attention 负责位置之间的信息交换，FFN 则对每个位置独立处理特征。FFN 使用共享参数：
+
+$$
+\operatorname{FFN}(\mathbf{x})=
+\mathbf{W}_2^{\mathsf T}\operatorname{ReLU}(\mathbf{W}_1^{\mathsf T}\mathbf{x}+\mathbf{b}_1)+\mathbf{b}_2
+$$
+
+```text
+[B, L, D] → Linear → [B, L, D_ff] → ReLU → Linear → [B, L, D]
+```
+
+它不跨位置混合，所以单独修改某个位置，不会改变其他位置的 FFN 输出。中间的非线性不能省略，否则两层仿射变换仍可合并为一层。
+
+残差连接使用 $\mathbf{Y}=\mathbf{X}+F(\mathbf{X})$。子层输出为零时仍保留输入；反向传播也有一条直接路径。标量情况下导数为 $1+f'(x)$，但仍可能发生抵消，不能因此断言梯度永远不会消失。
+
+本次采用 Pre-LN：先归一化，再进入子层。
+
+$$
+\begin{aligned}
+\mathbf{Y}&=\mathbf{X}+\operatorname{Attention}(\operatorname{LN}_1(\mathbf{X})),\\
+\mathbf{Z}&=\mathbf{Y}+\operatorname{FFN}(\operatorname{LN}_2(\mathbf{Y})).
+\end{aligned}
+$$
+
+```python
+attention_output, weights = self.attention(self.norm1(X))
+Y = X + attention_output
+Z = Y + self.ffn(self.norm2(Y))
+```
+
+两条残差分别保留原始的 X 和更新后的 Y，而不是归一化结果。`LayerNorm(D)` 对每个位置自己的 D 个特征归一化，不跨 batch 或时间维统计。两次归一化有独立参数。
+
+多层 Block 按顺序连接，各层参数独立。整个模型在最后加一次 LayerNorm，然后映射到词表：
+
+```text
+token ID [B, L]
+→ token embedding + position embedding [B, L, D]
+→ 多个因果 Transformer Block [B, L, D]
+→ final LayerNorm [B, L, D]
+→ Linear(D, N_vocab)
+→ logits [B, L, N_vocab]
+```
+
+## Encoder、Decoder 与预测目标如何对应
+
+| 结构 | 信息访问方式 | 典型目标 |
+| --- | --- | --- |
+| BERT 式 Encoder | 双向 Self-Attention | 利用上下文恢复被选中遮盖的 token |
+| Encoder–Decoder | 源侧双向，目标侧因果，并通过 Cross-Attention 读取源侧 | 根据源序列生成目标序列 |
+| GPT 式 Decoder-only | 因果 Self-Attention，标准文本结构不需要读取 Encoder 的 Cross-Attention | 根据前缀预测下一个 token |
+
+这里讨论的是核心结构和典型目标，不是各模型全部预训练细节。BERT 的 `[MASK]` 输入 token 与 Attention 中禁止访问某些位置的 mask 也不是同一个概念。
+
+本次实现是一个教学用的 GPT 式模型：Pre-LN、可学习位置嵌入、ReLU FFN、因果自注意力，不含 Dropout、KV Cache 或嵌入与输出权重共享，并非某一版本 GPT 的精确复现。
+
+## Next-token Loss：输入与标签都要切分
+
+完整序列：
+
+```text
+<BOS> 我 爱 学 习 <EOS>
+```
+
+构造训练样本时：
+
+```text
+输入：<BOS> 我 爱 学 习
+标签： 我   爱 学 习 <EOS>
+```
+
+```python
+input_ids = tokens[:, :-1]
+labels = tokens[:, 1:]
+logits = model(input_ids)
+loss = F.cross_entropy(
+    logits.reshape(-1, logits.shape[-1]),
+    labels.reshape(-1),
+)
+```
+
+完整序列 `[B, L+1]` 被切成两个 `[B, L]`，不存在输入比标签多一个位置的问题。展平时合并的是 batch 和时间维，词表维必须保留：
+
+```text
+logits: [B, L, N_vocab] → [B*L, N_vocab]
+labels: [B, L]          → [B*L]
+```
+
+每行就是一次词表分类。直接传入 logits，不要先做 Softmax。无 padding 时，默认平均交叉熵对应：
+
+$$
+\mathcal{L}=-\frac{1}{BL}\sum_{b=1}^{B}\sum_{t=1}^{L}
+\log p_\theta(y_{b,t}\mid x_{b,1:t})
+$$
+
+### 一次没有报错的维度错误
+
+训练时曾写成：
+
+```python
+loss = F.cross_entropy(model(tokens[:, :-1]), tokens[:, 1:])
+```
+
+模型输出是 `[B, L, N_vocab]`，而交叉熵的三维输入按 `[B, 类别数, 其他位置]` 解释。它会把时间维当成类别维。
+
+本例恰好 $L=N_{\mathrm{vocab}}=8$，shape 碰巧匹配，代码没有报错。100 轮后，错误目标下的训练 Loss 已降到 `0.0045`，但按词表维计算的 next-token 准确率只有约 `16.7%`。
+
+这个矛盾不是先调学习率或增加训练轮次能解决的。先核对每一维代表什么，才发现优化器正在认真优化一个错误目标。
+
+修正后，又补了一个 $L=5$、词表大小为 8 的检查，并用正确类别的 log 概率独立核对 Loss：
+
+```python
+log_probs = torch.log_softmax(logits, dim=-1)
+expected_loss = -log_probs.gather(
+    -1, labels.unsqueeze(-1)
+).mean()
+```
+
+这次经历说明：数值下降证明目标被优化，不证明目标定义正确。关键维度在测试中取不同大小，能避免一部分“形状巧合”。
+
+## 实验：训练一个循环数字语言模型
+
+为了在 CPU 上快速验证完整流程，任务只使用数字 `0～7`，规则为：
+
+$$
+x_{t+1}=(x_t+1)\bmod8
+$$
+
+例如完整序列是 `[0,1,2,3,4,5,6,7,0]`，得到 8 个 next-token 预测位置。
+
+| 配置 | 数值 |
+| --- | --- |
+| 词表大小 | 8 |
+| 模型维度 / FFN 中间维度 | 32 / 64 |
+| Block 数量 / 头数 | 2 / 4 |
+| 可学习位置表容量 | 16 |
+| 实际训练输入长度 | 8 |
+| batch size / epoch | 3 / 100 |
+| 优化器 | AdamW，学习率 0.003，weight decay 0.01 |
+| 训练序列起点 | 0～5，共 6 条 |
+| 验证序列起点 | 6 |
+| 最终测试起点 | 7 |
+
+每条完整序列不同，但它们共享同一个简单循环规律，也共享大量局部转移。这是受控的新起点测试，不是独立自然语言语料上的泛化评价。更简单的转移表就能解决它；使用 Transformer 的目的是核对模型、训练目标和生成过程能否连起来。
+
+修正交叉熵维度后的实际记录如下。每轮指标都在参数更新结束后重新评价：
+
+| 轮次 | 训练 Loss | 训练 token 准确率 | 验证 Loss | 验证 token 准确率 |
+| --- | ---: | ---: | ---: | ---: |
+| 初始 | 2.3673 | — | 2.2892 | 25.0% |
+| 1 | 2.0001 | 25.0% | 2.0091 | 37.5% |
+| 20 | 0.0694 | 100% | 0.1012 | 100% |
+| 40 | 0.0178 | 100% | 0.0281 | 100% |
+| 100 | 0.0043 | 100% | 0.0080 | 100% |
+
+按验证 Loss 选择的最佳轮次为 100。恢复最佳参数后，保留起点 7 的最终测试 Loss 为 `0.009428`，8 个预测位置全部正确。没有根据这个测试结果继续调整模型。
+
+准确率已经达到 100% 后，Loss 仍可下降：最高分 token 已经正确，但模型还可以继续提高分配给正确 token 的概率。
+
+## 从真实前缀评价到自由生成
+
+训练和上述 token 评价使用真实前缀，也就是 teacher forcing。自由生成则把模型自己的预测接回输入：
+
+```python
+@torch.no_grad()
+def generate(model, prompt, max_new_tokens):
+    model.eval()
+    generated = prompt.clone()
+    for _ in range(max_new_tokens):
+        logits = model(generated)
+        next_logits = logits[:, -1, :]
+        next_token = next_logits.argmax(dim=-1, keepdim=True)
+        generated = torch.cat([generated, next_token], dim=1)
+    return generated
+```
+
+这个简化片段假设非空前缀、没有 padding，且每次前向长度都不超过位置表容量；正式练习包含对应检查。
+
+为什么只取最后位置？因为前面位置的输出分别预测其后一个 token，而当前续写需要的是“整个已有前缀之后的下一个 token”。不能把所有位置的 argmax 一次追加到末尾。
+
+贪心选择取最高分 ID，不需要先 Softmax。得到 `[B,1]` 后沿时间维拼接，序列每次增加一个 token。
+
+加载保存的最佳模型，只给 `[7]`，实际生成：
+
+```text
+[7]
+[7, 0]
+[7, 0, 1]
+...
+[7, 0, 1, 2, 3, 4, 5, 6, 7]
+```
+
+8 个新增 token 全部符合规律。最后一次前向输入长度为 8，只使用训练过的位置索引 `0～7`。虽然位置表容量为 16，本次结果没有验证未训练位置或更长序列上的行为。
+
+真实前缀下预测正确，不保证自由生成永远正确：一旦产生错误 token，之后模型接收的上下文就可能偏离训练数据。本次两种评价都通过，是这个小任务上的实验结果。
+
+## 用不变量检查实现，比只看 shape 更有效
+
+这次逐步实现时，以下对照特别有用：
+
+| 检查 | 主要发现什么问题 |
+| --- | --- |
+| 批量 Attention 与逐样本、逐头计算一致 | 转置、缩放或头维处理错误 |
+| 拆头再合头恢复原始元素顺序 | shape 正确但元素错位 |
+| 修改未来 token，前缀输出不变 | 因果掩码方向或应用位置错误 |
+| 修改 padding 的 K/V，真实位置输出不变 | padding 广播方向错误 |
+| 子层输出为零，Pre-LN Block 保留原输入 | 残差路径接错 |
+| 整句前缀 logits 与只输入前缀时一致 | 多层模型中的未来信息泄漏 |
+| 交叉熵等于逐位置正确标签的负 log 概率平均 | 类别维或标签对齐错误 |
+
+现在，一串 token 从查表、交换信息、逐位置变换，到预测和生成，已经能对应到具体的参数与 Tensor 运算。更大模型会改变规模、组件和执行方式，但理解它们之前，先保证这条基本链路中的每个位置、每个维度和每个训练目标都能解释清楚。
