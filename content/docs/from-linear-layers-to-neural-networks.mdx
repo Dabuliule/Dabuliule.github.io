@@ -1,440 +1,597 @@
 ---
-title: "从线性层到神经网络：非线性、梯度与训练循环"
+title: "从线性模型到神经网络：一步步理解网络如何学习"
 date: "2026-09-14"
 tag: "AI"
 order: "2"
-description: "从 X @ W + b 出发，理解为什么叠加线性层还不够，ReLU 怎样改变表达与梯度，以及如何用原生 PyTorch 完成一个批量网络的训练。"
+description: "从一条直线解决不了的问题出发，用同一个例子理解线性层、ReLU、反向传播，再写出包含批量训练、验证和最佳参数保存的 PyTorch 程序，并理解 Dropout、LayerNorm 与 AdamW 的作用。"
 ---
 
-线性模型用 `X @ W + b` 将输入映射为输出。扩展成多层神经网络后，训练仍然使用损失函数、反向传播和参数更新，主要变化在于前向函数：中间层构造特征，激活函数引入非线性。
+上一篇[从 Loss 到泛化](/docs/from-loss-to-generalization)中，我们已经知道：模型先做预测，Loss 衡量预测错了多少，梯度告诉参数应该往哪个方向调整。
 
-在上一篇[从 Loss 到泛化](/docs/from-loss-to-generalization)的基础上，本文围绕五个问题展开：
+先别急着增加新的 API。我们从一道小题开始。
 
-- 一个线性层怎样同时产生多个输出？
-- 多叠几层，为什么不一定增加表达能力？
-- ReLU 没有参数，为什么会影响训练？
-- Loss 还大于零，梯度为什么已经变成零？
-- 单个样本的训练，怎样变成批量矩阵训练？
+假设输入是一个数，要求模型输出它的绝对值：输入 -2，答案是 2；输入 0，答案是 0；输入 2，答案还是 2。如果模型只能写成 `y = w * x + b`，它能学会吗？
 
-本文直接使用 PyTorch Tensor 实现一个两层网络：先标注前向计算的 shape，再用标量例子推导梯度，最后给出可运行的批量训练代码。参数创建、更新和梯度清零都显式写出，便于与后续的 `nn.Module` 和优化器对应。
+这道题会带着我们走完本文：先找到直线的局限，再搭出一个能“拐弯”的网络；看清参数怎样学习后，再把它交给 PyTorch 管理。最后，我们还要判断模型是真的学到了规律，还是只记住了练习题。
 
-## 符号与维度
-
-本文用 $x,w$ 等普通斜体表示**标量**，用 $\mathbf{x},\mathbf{b}$ 等粗体小写表示**向量**，用 $\mathbf{X},\mathbf{W}$ 等粗体大写表示**矩阵**。$B$ 表示 batch 大小，$D$ 表示输入维度，$H$ 表示隐藏维度，$O$ 表示输出维度。
-
-数学中的向量默认是列向量，数据矩阵的每一行对应一个样本。代码采用 `X @ W + b` 的权重布局，偏置通过广播加到每一行；公式会将广播显式写出。
-
-## 线性层：同一份输入，计算多个加权组合
-
-之前的线性模型只有一个输出：
-
-$$
-z=x_1w_1+x_2w_2+b=\mathbf{x}^{\mathsf T}\mathbf{w}+b
-$$
-
-如果希望两个输入特征产生三个输出，就为每个输出准备一组独立的权重和偏置：
-
-$$
-\begin{aligned}z_1&=x_1w_{11}+x_2w_{21}+b_1\\z_2&=x_1w_{12}+x_2w_{22}+b_2\\z_3&=x_1w_{13}+x_2w_{23}+b_3\end{aligned}
-$$
-
-把每组权重放在矩阵的一列：
-
-$$
-\mathbf{W}=\begin{bmatrix}w_{11}&w_{12}&w_{13}\\w_{21}&w_{22}&w_{23}\end{bmatrix}\in\mathbb{R}^{2\times3},\qquad
-\mathbf{b}=\begin{bmatrix}b_1\\b_2\\b_3\end{bmatrix}\in\mathbb{R}^{3}
-$$
-
-对一批输入，三个输出可以同时计算：
-
-$$
-\mathbf{Z}=\mathbf{X}\mathbf{W}+\mathbf{1}_B\mathbf{b}^{\mathsf T}
-$$
-
-$\mathbf{1}_B$ 是长度为 $B$ 的全 1 向量，$\mathbf{1}_B\mathbf{b}^{\mathsf T}$ 将偏置重复到每一行。对应代码为：
+读到最后，你应该能解释下面这段训练代码里的每一步，而不只是记住调用顺序：
 
 ```python
-Z = X @ W + b
+optimizer.zero_grad()
+prediction = model(X)
+loss = loss_function(prediction, y)
+loss.backward()
+optimizer.step()
 ```
 
-对应的 shape 是：
+## 1. 一条直线为什么解决不了这道题
+
+先把三个已知点代入模型：
+
+- 输入 0，输出要是 0，所以偏置 `b = 0`。
+- 输入 2，输出要是 2，所以权重 `w = 1`。
+- 可是输入 -2 时，模型就会输出 -2，而我们要的是 2。
+
+矛盾出现了。无论训练多久、怎样调整学习率，都不存在一组 `w、b` 能让这条直线同时通过三个点。
+
+这里需要分清两个问题：**模型有没有能力表达答案，以及训练能不能找到合适的参数。** 当前的问题出在前者。换一种优化器并不能让直线变成折线。
+
+绝对值函数的图像是一个 V：负半轴向下走，正半轴向上走。我们需要一种能让计算规则随输入区域变化的结构。
+
+## 2. 先让一个输入产生多个中间结果
+
+既然直接从输入算答案不够，我们试着分两步：第一步从输入提取几个中间特征，第二步用这些特征组合出答案。
+
+对绝对值这道题，可以先计算：
+
+$$
+h_1=x,\qquad h_2=-x
+$$
+
+输入 -2 时，中间结果是 `[-2, 2]`；输入 2 时，中间结果是 `[2, -2]`。这里还没有解决问题，但我们已经把输入从一个数变成了两个数。
+
+一般情况下，中间特征的规则也要由模型学习，所以写成：
+
+$$
+h_1=xw_1+b_1,\qquad h_2=xw_2+b_2
+$$
+
+**每个输出各有一组权重和偏置，这就是线性层。** 它可以把一个特征变成两个，也可以把两个特征变成几十个。这里的“特征”就是模型交给下一步使用的数值，不一定有现成的人类名称。
+
+多个样本一起计算时，把它们按行放进矩阵。下面三行分别表示三个样本：
+
+```python
+X = torch.tensor([[-2.0], [0.0], [2.0]])  # [3, 1]
+W = torch.tensor([[1.0, -1.0]])          # [1, 2]
+b = torch.tensor([0.0, 0.0])            # [2]
+H = X @ W + b                          # [3, 2]
+# tensor([[-2.,  2.],
+#         [ 0.,  0.],
+#         [ 2., -2.]])
+```
+
+`@` 表示矩阵乘法。`[3, 1] @ [1, 2]` 得到 `[3, 2]`：样本还是三个，每个样本变成了两个特征。偏置 `[2]` 会加到每一行，这叫广播；所有样本使用同一组参数。
+
+后面会反复出现 shape，先记住这一个规则就够了：
 
 ```text
-X: [batch_size, 2]
-W: [2, 3]
-b: [3]
-Z: [batch_size, 3]
+输入 X： [B, D]    B 个样本，每个样本 D 个特征
+权重 W： [D, H]    把 D 个特征组合成 H 个特征
+偏置 b： [H]       每个输出特征一个偏置
+输出：   [B, H]    样本数不变，特征数改变
 ```
 
-这里每一行仍然对应一个样本。线性层改变的是每个样本的特征维度，样本数量没有变化。
+严格说，带偏置的是仿射变换，深度学习里通常仍叫线性层。
 
-例如：
+## 3. 多接一层为什么不够，ReLU 又改变了什么
 
-```python
-import torch
+一个很自然的想法是：第一层算得不够好，那就再接一层。
 
-X = torch.tensor([[1.0, 2.0]])
-W = torch.tensor([[1.0, 0.0, -1.0], [2.0, 1.0, 1.0]])
-b = torch.tensor([0.0, 1.0, -1.0])
-
-Z = X @ W + b
-# tensor([[5., 3., 0.]])，shape 为 [1, 3]
-```
-
-这个线性层有 `2 * 3 + 3 = 9` 个参数。即使一次输入一百个样本，参数量也还是 9，因为所有样本共享同一组 `W` 和 `b`。
-
-偏置通过广播加到每一行：`[3]` 对齐为 `[1, 3]`，再与 `[batch_size, 3]` 相加。这不会产生新的可训练参数。
-
-严格来说，加上偏置的运算是仿射变换。深度学习里通常仍称它为线性层。本文使用 `W: [输入维度, 输出维度]` 的手写约定。
-
-## 为什么多叠线性层仍然不够
-
-先把两个线性层接起来：
+先看只有一个中间结果的情况：
 
 $$
-\begin{aligned}\mathbf{H}&=\mathbf{X}\mathbf{W}_1+\mathbf{1}_B\mathbf{b}_1^{\mathsf T}\\\mathbf{Y}&=\mathbf{H}\mathbf{W}_2+\mathbf{1}_B\mathbf{b}_2^{\mathsf T}\end{aligned}
+h=w_1x+b_1,\qquad \hat y=w_2h+b_2
 $$
 
-假设输入、隐藏特征和输出分别是：
-
-```text
-X:  [4, 2]
-W1: [2, 3]    b1: [3]
-H:  [4, 3]
-W2: [3, 1]    b2: [1]
-Y:  [4, 1]
-```
-
-代入并展开第二个式子：
+把第一式代入第二式：
 
 $$
-\begin{aligned}\mathbf{Y}&=(\mathbf{X}\mathbf{W}_1+\mathbf{1}_B\mathbf{b}_1^{\mathsf T})\mathbf{W}_2+\mathbf{1}_B\mathbf{b}_2^{\mathsf T}\\&=\mathbf{X}(\mathbf{W}_1\mathbf{W}_2)+\mathbf{1}_B(\mathbf{b}_1^{\mathsf T}\mathbf{W}_2+\mathbf{b}_2^{\mathsf T})\end{aligned}
+\hat y=(w_2w_1)x+(w_2b_1+b_2)
 $$
 
-于是可以定义：
+不管中间经过多少计算，最后还是“某个数乘 x，再加某个数”。把隐藏特征增加到多个，结论也一样：纯线性层可以合并成一个线性层。
 
-```python
-W_merged = W1 @ W2       # [2, 1]
-b_merged = b1 @ W2 + b2  # [1]
-Y = X @ W_merged + b_merged
-```
-
-第一层的偏置也经过了第二层的权重变换，所以合并偏置不是简单地把两个偏置相加。
-
-合并后的参数不依赖具体输入，意味着两种写法对任意兼容输入都等价。继续叠加第三层，也可以用同样的方法合并。
-
-> **只叠加线性层，最终仍然只能表达一个仿射变换。** 增加层数本身不能引入非线性。
-
-这说的是可表达的函数形式。不同分解方式仍可能影响优化过程，隐藏维度还可能限制等效权重的秩，但这些都不会把纯线性层组合变成非线性函数。
-
-## ReLU：不增加参数，却改变函数形式
-
-ReLU 的规则只有一条：
+所以我们要在两层之间加一个不能被这样合并的操作。这里选择 **ReLU**：
 
 $$
 \operatorname{ReLU}(z)=\max(0,z)
 $$
 
-它逐元素把负数变成零，非负数保持不变：
+名字看起来复杂，规则却很简单：负数变成 0，正数保持原样。
+
+回到刚才的两个中间特征，先分别经过 ReLU，再相加：
 
 $$
-\operatorname{ReLU}\!\left(\begin{bmatrix}-2\\0\\3\end{bmatrix}\right)=\begin{bmatrix}0\\0\\3\end{bmatrix}
+a_1=\operatorname{ReLU}(x),\qquad a_2=\operatorname{ReLU}(-x),\qquad \hat y=a_1+a_2
 $$
 
-为什么它不能用同一个 `w * x + b` 表示？如果匹配 `x=0` 和 `x=1` 的 ReLU 输出，就必须有 `b=0`、`w=1`。此时输入 `x=-1`，线性模型输出 -1，ReLU 却输出 0。
-
-把 ReLU 放到两层之间：
-
-```python
-H = X @ W1 + b1  # [batch_size, 3]
-A = torch.relu(H)  # [batch_size, 3]
-Y = A @ W2 + b2  # [batch_size, 1]
-```
-
-写成矩阵形式为：
-
-$$
-\begin{aligned}
-\mathbf{H}&=\mathbf{X}\mathbf{W}_1+\mathbf{1}_B\mathbf{b}_1^{\mathsf T}\\
-\mathbf{A}&=\operatorname{ReLU}(\mathbf{H})\\
-\hat{\mathbf{Y}}&=\mathbf{A}\mathbf{W}_2+\mathbf{1}_B\mathbf{b}_2^{\mathsf T}
-\end{aligned}
-$$
-
-其中 ReLU **逐元素作用于矩阵**。shape 没变，但中间特征的值可能改变。比如某个样本的 `H` 是 `[5, 2, -3]`，激活后就是 `[5, 2, 0]`。
-
-若第二层权重向量为 $\mathbf{w}_2=[2,-1,1]^{\mathsf T}$，偏置为 $0.5$：
-
-$$
-\begin{aligned}\hat{y}_{\text{无激活}}&=5\times2-2-3+0.5=5.5\\\hat{y}_{\text{ReLU}}&=5\times2-2+0+0.5=8.5\end{aligned}
-$$
-
-ReLU 没有可训练参数，改变的是不同输入下参与后续计算的特征。网络一般不能再按之前的公式合并成一个线性层。不过，特定参数或限定输入范围下仍可能退化为线性关系；加了 ReLU 并不保证所有情况下都会表现出非线性。
-
-## 梯度怎样穿过 ReLU
-
-为了把求导过程看清楚，先缩成没有偏置、只有一个隐藏单元的网络。所有变量都是标量，shape 为 `[]`：
-
-$$
-\begin{aligned}h&=xw_1,\qquad a=\operatorname{ReLU}(h)\\\hat{y}&=aw_2\\\ell&=\frac12(\hat{y}-y)^2\end{aligned}
-$$
-
-前面的 0.5 用于抵消平方求导产生的系数 2。这里的 Loss 是一半的平方误差，和直接使用 MSE 的数值相差一倍。
-
-ReLU 的局部导数可以直接从函数规则理解：
-
-- `h > 0` 时，输出等于输入，输入增加一点，输出增加同样多，导数是 1。
-- `h < 0` 时，只要变化后仍为负数，输出一直是零，导数是 0。
-- `h = 0` 时，左右斜率不同，数学上不可导；PyTorch 的 ReLU 反向传播在这里使用 0。
-
-`w1` 影响 Loss 的路径是：
-
-$$
-w_1\longrightarrow h\longrightarrow a\longrightarrow\hat{y}\longrightarrow\ell
-$$
-
-链式法则要求沿途的局部导数相乘：
-
-$$
-\frac{\partial\ell}{\partial w_1}=\frac{\partial\ell}{\partial\hat{y}}\frac{\partial\hat{y}}{\partial a}\frac{\partial a}{\partial h}\frac{\partial h}{\partial w_1}
-$$
-
-逐项看：
-
-$$
-\begin{aligned}\frac{\partial\ell}{\partial\hat{y}}&=\hat{y}-y,&\frac{\partial\hat{y}}{\partial a}&=w_2\\\frac{\partial a}{\partial h}&=\mathbf{1}_{h>0},&\frac{\partial h}{\partial w_1}&=x\end{aligned}
-$$
-
-$\mathbf{1}_{h>0}$ 是**指示函数**：条件成立取 1，否则取 0；这里得到的是标量，不是全 1 向量。$\hat{y}$ 和 $y$ 分别对应代码中的 `prediction` 和 `target`。
-
-因此手算梯度可以写为：
-
-```python
-dloss_dprediction = prediction - target
-da_dh = (h > 0).float()
-
-manual_dw2 = dloss_dprediction * a
-manual_dw1 = dloss_dprediction * w2 * da_dh * x
-```
-
-最后的 $x$ 来自 $\partial h/\partial w_1$，不能省略。若只计算前三项，得到的是 $\partial\ell/\partial h$；继续乘以 $x$，才得到需要用于更新 $w_1$ 的梯度。
-
-当 `x=2`、`w1=1`、`w2=3`、目标为 1 时：
-
-$$
-\begin{aligned}h&=2,\quad a=2,\quad\hat{y}=6\\\frac{\partial\ell}{\partial w_2}&=(6-1)\times2=10\\\frac{\partial\ell}{\partial w_1}&=(6-1)\times3\times1\times2=30\end{aligned}
-$$
-
-这两个手算结果可以用来核对 `loss.backward()` 得到的 `w1.grad` 和 `w2.grad`。Autograd 沿计算图执行链式法则并写入梯度，参数更新是之后的独立步骤。
-
-## detach 和 no_grad 各自负责什么
-
-核对手算梯度时，只需要比较数值，不需要为核对过程再构建一张计算图。`detach()` 可以将某个 Tensor 从当前求导关系中分离出来。
-
-在上面的手算公式中，不使用它也能得到正确数值。只是因为 `prediction` 等 Tensor 带有求导关系，PyTorch 还会记录手算部分的运算，而这次并不需要继续对手算梯度求导。
-
-```python
-dloss_dprediction = prediction.detach() - target
-```
-
-这里 `detach()` 返回数值相同、与原计算图断开的 Tensor，不修改原来的 `prediction`。如果希望整个手算部分都不建立计算图，其他参与计算的带梯度 Tensor 也需要相应处理，或者把手算部分放进 `torch.no_grad()` 中。
-
-`detach()` 不复制数据，它与原 Tensor 共享存储。因此不能把它理解为一份独立备份。
-
-`no_grad()` 则控制一段运算是否被记录。手动更新参数时使用：
-
-```python
-with torch.no_grad():
-    w1 -= learning_rate * w1.grad
-    w2 -= learning_rate * w2.grad
-```
-
-这不取消参数本身的 `requires_grad=True`。退出上下文后，下一轮前向计算仍会建立计算图。
-
-## 学习率更大，第一步更好，却可能无法继续学习
-
-用刚才的参数做一次更新，学习率取 0.01：
-
-$$
-\begin{aligned}w_1^{\mathrm{new}}&=1-0.01\times30=0.7\\w_2^{\mathrm{new}}&=3-0.01\times10=2.9\end{aligned}
-$$
-
-重新计算预测和 Loss：
-
-$$
-\begin{aligned}\hat{y}&=\operatorname{ReLU}(2\times0.7)\times2.9=4.06\\\ell&=\tfrac12(4.06-1)^2=4.6818\end{aligned}
-$$
-
-相比更新前的 12.5，Loss 下降了。接着把这个过程重复 100 次，并让两个学习率都从相同参数开始，得到：
-
-| 学习率 | 第一次更新后 Loss | 第 100 次更新后 Loss | 最终预测 |
+| 输入 x | 第一层结果 h₁、h₂ | ReLU 后 a₁、a₂ | 相加得到预测 |
 | --- | --- | --- | --- |
-| 0.01 | 4.6818 | 接近 0 | 接近 1 |
-| 0.1 | 0.5 | 0.5 | 0 |
+| -2 | -2、2 | 0、2 | 2 |
+| 0 | 0、0 | 0、0 | 0 |
+| 2 | 2、-2 | 2、0 | 2 |
 
-较大的学习率第一步反而更好，但随后停住了。原因是第一次更新就把 `w1` 变成了 -2：
+我们真的构造出了绝对值函数。负数输入时由第二个特征起作用，正数输入时由第一个特征起作用，计算因此有了一个“拐弯”。
 
-$$
-h=2\times(-2)=-4,\qquad a=\operatorname{ReLU}(-4)=0
-$$
+这就是激活函数的作用：**引入非线性，让网络能够表达单个线性层做不到的关系。** ReLU 自己没有可训练参数，但它改变了前后两层组合起来能表达什么。
 
-于是：
-
-- **$w_1$ 的梯度为零**：链式法则中乘上了 ReLU 的零导数。
-- **$w_2$ 的梯度也为零**：$\partial\hat{y}/\partial w_2=a$，而此时 $a=0$。
-
-参数不再变化，同一个输入产生的 `h` 就一直为负。再训练一千步也无法离开这个状态。
-
-这是 ReLU 神经元失活的一种具体情形。不过，某个样本激活为零，不代表神经元永久失活；其他样本可能产生正的激活并提供梯度。本实验只有一个固定样本、一个隐藏单元，而且没有偏置。
-
-这次实验说明了两件事：一次 Loss 下降不保证后续训练顺利；梯度为零也不一定代表模型已经学好。
-
-## 从单个样本扩展到批量：先检查 Loss 的 shape
-
-批量训练时，参数仍然共享。四个样本产生四个预测值：
-
-```text
-X:           [4, 2]
-H、A:        [4, 3]
-predictions: [4, 1]
-targets:     [4, 1]
-```
-
-每个样本先计算自己的损失，再平均：
+把这套计算写成常见的两层网络：
 
 ```python
-per_sample_loss = 0.5 * (predictions - targets) ** 2  # [4, 1]
-loss = per_sample_loss.mean()  # []
-loss.backward()
+H = X @ W1 + b1
+A = torch.relu(H)
+prediction = A @ W2 + b2
 ```
 
-对应的是：
+中间的 `A` 叫隐藏层表示；“隐藏”只是说它不是我们直接提供的输入或答案。我们把包含权重的两层称为两层网络，ReLU 是它们之间的激活函数。
+
+刚才的权重是我们根据答案手工设计的。实际任务中，我们通常不知道它们应该是多少。接下来才进入“学习”：从初始参数出发，用数据把参数调出来。
+
+## 4. 网络怎样知道前面的参数该怎么改
+
+先把网络缩小到一个输入、一个隐藏单元，并暂时去掉偏置。这样每一步都能手算：
 
 $$
-L=\frac14\sum_{i=1}^{4}\ell_i=\frac14\sum_{i=1}^{4}\frac12(\hat{y}_i-y_i)^2
+h=xw_1,\qquad a=\operatorname{ReLU}(h),\qquad \hat y=aw_2
 $$
 
-每个参数的梯度也是各样本损失梯度的平均。它已经汇总了样本贡献，因此**梯度 shape 与参数一致，不额外保留 batch 维度**：
+取 `x=2、w1=1、w2=3`，目标答案 `y=1`。这只是用来演示一次更新的独立小题：
 
-| 参数 | 参数 shape | 梯度 shape |
+```text
+输入 2 → 乘 w1=1 → h=2 → ReLU → a=2 → 乘 w2=3 → 预测 6
+```
+
+用平方误差衡量预测和答案的距离：
+
+$$
+\ell=\frac12(\hat y-y)^2=\frac12(6-1)^2=12.5
+$$
+
+前面的二分之一只是为了让求导更简洁，不改变误差最小的位置。
+
+现在问：`w1` 增加一点，Loss 会增加多少？`w1` 不直接出现在 Loss 的最后一步中，但它先影响 `h`，再影响 `a`，再影响预测，最终影响 Loss。因此要沿着这条路径，把每一步的变化率乘起来。这就是链式法则。
+
+$$
+\frac{\partial\ell}{\partial w_1}
+=\frac{\partial\ell}{\partial\hat y}
+\frac{\partial\hat y}{\partial a}
+\frac{\partial a}{\partial h}
+\frac{\partial h}{\partial w_1}
+=(\hat y-y)\cdot w_2\cdot\operatorname{ReLU}'(h)\cdot x
+$$
+
+这里每个因子都有具体含义：
+
+| 因子 | 从哪一步来 | 本例中的值 |
 | --- | --- | --- |
-| W1 | [2, 3] | [2, 3] |
-| b1 | [3] | [3] |
-| W2 | [3, 1] | [3, 1] |
-| b2 | [1] | [1] |
+| 预测误差 | 平方损失对预测求导 | 6 - 1 = 5 |
+| w₂ | 预测等于 a × w₂ | 3 |
+| ReLU 的局部导数 | h 为正时，输出随输入等量变化 | 1 |
+| x | h 等于 x × w₁ | 2 |
 
-例如，输出偏置加到每个样本的预测上，预测对偏置的导数都是 1。所以在这个损失定义下：
+因此 `w1` 的梯度是 `5 × 3 × 1 × 2 = 30`。`w2` 的路径更短，梯度是 `(预测 - 答案) × a = 10`。
+
+PyTorch 的 `backward()` 就是在计算图上自动完成这类求导。它算出梯度，但还没有修改参数。
+
+若学习率取 0.01，按梯度的反方向更新：
 
 $$
-\frac{\partial L}{\partial b_2}=\frac{1}{B}\sum_{i=1}^{B}(\hat{y}_i-y_i)
+w_1\leftarrow1-0.01\times30=0.7,\qquad
+w_2\leftarrow3-0.01\times10=2.9
 $$
 
-以下方完整代码的初始参数为例，四个预测误差是 `[6.5, 6.5, 0.5, 0.5]`，平均为 3.5，因此第一次反向传播应得到 `b2.grad = 3.5`。
+重新预测得到 `ReLU(2 × 0.7) × 2.9 = 4.06`，Loss 变成 4.6818，比原来的 12.5 小。一次学习就完成了：**预测、算误差、求梯度、改参数。**
 
-这里最隐蔽的错误是把目标写成 `[4]`：
+### 为什么误差不为零，网络却可能不再学习
 
-```text
-predictions: [4, 1]
-targets:        [4] → 对齐为 [1, 4]
-相减结果:    [4, 4]
-```
+ReLU 在负半轴的输出始终是 0。只要输入仍为负数，小幅改变输入也不影响输出，局部导数就是 0；在 0 点数学上不可导，PyTorch 使用 0 作为反向传播的取值。
 
-结果的第 i 行、第 j 列成了 `prediction_i - target_j`，即每个预测都和所有目标相减。程序仍然可以求平均、反向传播，却已经在优化错误的目标。
+如果刚才的学习率改成 0.1，第一步就会把 `w1` 更新为 -2。下一次前向计算中：
 
-**广播成功不等于计算正确。** 本例在计算损失前直接检查：
+$$
+h=2\times(-2)=-4,\qquad a=0,\qquad\hat y=0
+$$
 
-```python
-assert predictions.shape == targets.shape
-```
+此时 Loss 仍有 0.5，可是 `w1` 的梯度被 ReLU 的零导数截断，`w2` 的梯度也因为 `a=0` 而变成零。这道只有一个样本、一个隐藏单元且没有偏置的小题，就停在这里了。
 
-## 一个可以直接运行的批量训练循环
+这说明梯度为零不一定意味着答案正确。真实网络里，一个样本的激活为零也不意味着这个单元永久失活，其他样本仍可能激活它。
 
-下面是最终实验的完整代码。它使用四个二维样本、三个隐藏单元和一个回归输出，每轮都用全部样本训练，因此这里一个 epoch 对应一次参数更新。
+## 5. 先亲手写一次更新，再交给框架
+
+下面的代码可以直接运行，核对上面的两个梯度和更新结果：
 
 ```python
 import torch
 
-X = torch.tensor([[1.0, 2.0], [3.0, 1.0], [-1.0, 0.0], [0.0, -2.0]])  # [4, 2]
-targets = torch.tensor([[1.0], [2.0], [-1.0], [0.0]])  # [4, 1]
+x = torch.tensor(2.0)
+y = torch.tensor(1.0)
+w1 = torch.tensor(1.0, requires_grad=True)
+w2 = torch.tensor(3.0, requires_grad=True)
 
-W1 = torch.tensor([[1.0, 0.0, -1.0], [2.0, 1.0, 1.0]], requires_grad=True)  # [2, 3]
-b1 = torch.tensor([0.0, 1.0, -1.0], requires_grad=True)  # [3]
-W2 = torch.tensor([[2.0], [-1.0], [1.0]], requires_grad=True)  # [3, 1]
-b2 = torch.tensor([0.5], requires_grad=True)  # [1]
+prediction = torch.relu(x * w1) * w2
+loss = 0.5 * (prediction - y) ** 2
+loss.backward()
+print(w1.grad.item(), w2.grad.item())  # 30.0 10.0
 
-parameters = [W1, b1, W2, b2]
-learning_rate = 0.01
+with torch.no_grad():
+    w1 -= 0.01 * w1.grad
+    w2 -= 0.01 * w2.grad
+    new_prediction = torch.relu(x * w1) * w2
+    new_loss = 0.5 * (new_prediction - y) ** 2
+print(new_prediction.item(), new_loss.item())  # 约 4.06、4.6818
 
-for epoch in range(1, 301):
-    H = X @ W1 + b1  # [4, 3]
-    A = torch.relu(H)  # [4, 3]
-    predictions = A @ W2 + b2  # [4, 1]
-    assert predictions.shape == targets.shape
-    loss = (0.5 * (predictions - targets) ** 2).mean()  # []
-
-    loss.backward()
-
-    with torch.no_grad():
-        for parameter in parameters:
-            parameter -= learning_rate * parameter.grad
-
-    for parameter in parameters:
-        parameter.grad.zero_()
-
-    with torch.no_grad():
-        updated_predictions = torch.relu(X @ W1 + b1) @ W2 + b2
-        updated_loss = (0.5 * (updated_predictions - targets) ** 2).mean()
-
-    if epoch == 1 or epoch % 50 == 0:
-        print(f"epoch={epoch:3d}  train_loss={updated_loss.item():.6f}")
-
-print(updated_predictions)
+w1.grad.zero_()
+w2.grad.zero_()
 ```
 
-有几个容易被简短代码掩盖的细节：
+这里有三个细节值得停下来理解。
 
-1. **每轮重新前向计算。** 参数已经变化，旧的预测和 Loss 不会自动刷新。
-2. **一次 backward 计算四组参数的梯度。** 它们都通过本轮计算图影响同一个 Loss。
-3. **参数依次更新，但使用的是同一次 backward 得到的梯度。** 更新 `W1` 后，不会自动重算 `W2.grad`。
-4. **`-=` 原地修改参数。** 在这个循环里写 `parameter = parameter - ...`，只会改变局部变量的指向，不会更新原来的 `W1` 等对象。
-5. **梯度使用后清零。** `.grad` 默认累加；也可以在下一轮 backward 前清零，关键是不要意外累积旧梯度。
-6. **更新后的评价不需要计算图。** 这里只观察 Loss，用 `no_grad()` 即可。
+首先，更新参数时使用 `no_grad()`，表示这段修改不需要被记录进求导计算图。参数本身仍然允许求导，下一轮正常前向计算时还会建立新图。
 
-## 实验结果：训练误差与泛化能力
+其次，旧的 `prediction` 和 `loss` 不会随参数更新自动刷新。要观察更新效果，必须重新计算。
 
-实际运行 300 轮后：
+最后，PyTorch 默认把新梯度累加到 `.grad` 上，所以普通训练中每次反向传播前都要确保旧梯度已清除。这里在使用后清零；后面的代码改为每批开始时清零。
+
+如果只想取一个 Tensor 的数值去做其他计算，可以用 `detach()` 断开它与当前求导图的关系。不过 `detach()` 共享原数据的存储，并不是独立备份；需要独立 Tensor 副本时还要 `clone()`。
+
+## 6. 从一个样本变成一批样本
+
+回到学习绝对值的问题。每次只看一道题可以训练，但我们通常会把多道题组成一批，叫一个 **batch**。
+
+如果一批有 32 个数，隐藏层有 16 个单元，那么计算过程的 shape 是：
 
 ```text
-epoch=  1  train_loss=4.734133
-epoch= 50  train_loss=0.016504
-epoch=100  train_loss=0.011421
-epoch=150  train_loss=0.009378
-epoch=200  train_loss=0.007790
-epoch=250  train_loss=0.006481
-epoch=300  train_loss=0.005396
+X                 [32, 1]
+W1、b1            [1, 16]、[16]
+H、A              [32, 16]
+W2、b2            [16, 1]、[1]
+prediction、y     [32, 1]
 ```
 
-这里打印的全部是每轮更新后的 Loss。初始化时的 Loss 为 10.625。
+每个样本先产生自己的误差，再对这一批取平均：
 
-| 目标值 | 最终预测 |
+$$
+L=\frac1B\sum_{i=1}^{B}\frac12(\hat y_i-y_i)^2
+$$
+
+`B` 是本批样本数，`i` 是样本编号。得到的 `L` 是一个标量，调用一次 `backward()` 就能汇总各个样本对参数的影响。参数被所有样本共享，所以梯度的 shape 与参数相同，不会再多出一个 batch 维度。
+
+有一个常见错误要在这里提前挡住：预测是 `[32, 1]`，标签却写成 `[32]`。它们相减会广播成 `[32, 32]`，变成每个预测与所有标签配对，程序可能照样运行，却算错了目标。
+
+因此回归任务可以先做一个明确检查：
+
+```python
+assert prediction.shape == y.shape
+loss = (0.5 * (prediction - y) ** 2).mean()
+```
+
+这条检查针对本文的逐元素回归损失。分类任务使用交叉熵时，预测分数和类别标签的 shape 本来就不同，不能照搬。
+
+## 7. 用 Module 和 DataLoader 管理重复工作
+
+现在我们知道每一步在做什么了。网络变大后，继续手动维护每个权重、偏置和参数列表会很繁琐，PyTorch 提供了相应封装。
+
+### Module：收集参数，定义前向计算
+
+同一个两层网络可以写成：
+
+```python
+from torch import nn
+
+model = nn.Sequential(
+    nn.Linear(1, 16),
+    nn.ReLU(),
+    nn.Linear(16, 1),
+)
+```
+
+`nn.Linear(1, 16)` 创建并管理第一层的权重和偏置，`nn.Sequential` 按顺序连接各层。调用 `model(X)`，就依次完成我们前面手写的计算。
+
+这个网络有多少参数？第一层是 `1 × 16 + 16 = 32`，第二层是 `16 × 1 + 1 = 17`，共 49 个。ReLU 没有参数，batch 大小也不影响参数量。
+
+自定义网络时，通常继承 `nn.Module`，在 `forward` 中写计算。子模块的参数会被递归收集；自行定义的可训练 Tensor 应使用 `nn.Parameter` 注册。普通 Tensor 即使有 `requires_grad=True`，也不会仅因为赋给 `self` 就自动进入 `model.parameters()`。
+
+还要注意存储约定：手写代码的 `W` 是 `[输入维度, 输出维度]`；`nn.Linear` 的 `weight` 是 `[输出维度, 输入维度]`，内部相当于 `X @ weight.T + bias`。二者计算含义相同，但复制权重时需要转置。
+
+### DataLoader：把数据按批交出来
+
+`TensorDataset` 把输入和对应答案配在一起，`DataLoader` 决定每次交出多少样本、是否打乱顺序：
+
+```python
+from torch.utils.data import DataLoader, TensorDataset
+
+loader = DataLoader(TensorDataset(X, y), batch_size=32, shuffle=True)
+```
+
+完整看过一遍训练集叫一个 **epoch**。如果有 100 个样本，batch 大小为 32，不丢弃最后一批，那么一个 epoch 有四批，大小分别是 `32、32、32、4`。每批更新一次参数，就有四次更新。
+
+统计整轮平均 Loss 时，也要按样本数加权。假设四批平均损失分别为 `L1` 到 `L4`，应计算：
+
+$$
+L_{\mathrm{epoch}}=\frac{32L_1+32L_2+32L_3+4L_4}{100}
+$$
+
+直接把四个数平均，会把最后四个样本的影响放大。后面的评价函数会按这个原则汇总。
+
+## 8. 优化器接管更新，但并没有接管求导
+
+前面手写的更新是：
+
+```python
+parameter -= learning_rate * parameter.grad
+```
+
+对应最基本的 SGD。使用优化器后，只需要在循环外创建一次：
+
+```python
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+```
+
+每一批执行：
+
+```python
+optimizer.zero_grad()   # 清除上一批留下的梯度
+prediction = model(X)   # 用当前参数做预测
+loss = loss_function(prediction, y)
+loss.backward()        # 求梯度，尚未更新参数
+optimizer.step()       # 根据梯度更新参数
+```
+
+这个顺序现在应该能够逐项解释了。`backward()` 和 `step()` 是两个独立动作，把 `step()` 错放到 batch 循环外，并不会自动变成正确的整批训练。
+
+### 为什么还会有 Adam
+
+不同参数的梯度可能大小相差很多，同一个参数的梯度方向也可能来回变化。只用当前梯度更新，有时会走得不稳定。带动量的 SGD 会保留过去的方向；Adam 则同时记录梯度方向和梯度平方的移动平均。
+
+先只看一个参数。设第 `t` 步的梯度是 $g_t$，Adam 更新两份记录：
+
+$$
+m_t=\beta_1m_{t-1}+(1-\beta_1)g_t
+$$
+
+$$
+v_t=\beta_2v_{t-1}+(1-\beta_2)g_t^2
+$$
+
+$m_t$ 平滑近期梯度方向，$v_t$ 记录梯度的平方尺度。$\beta_1$、$\beta_2$ 控制旧记录保留多少。这里的平方平均不是方差，因为没有先减去均值。
+
+这两份记录最初都是 0，早期会被初始零值拉低。例如梯度一直是 2，$\beta_1=0.9$，第一步 $m_1$ 只有 0.2。Adam 用下面的偏差修正处理这个影响：
+
+$$
+\hat m_t=\frac{m_t}{1-\beta_1^t},\qquad
+\hat v_t=\frac{v_t}{1-\beta_2^t}
+$$
+
+再更新参数 $\theta$：
+
+$$
+\theta_t=\theta_{t-1}-\eta\frac{\hat m_t}{\sqrt{\hat v_t}+\varepsilon}
+$$
+
+$\eta$ 是学习率，$\varepsilon$ 是避免分母为零的小量。可以把它理解为：在平滑后的方向上，根据这个参数过去的梯度尺度调整步幅。每个参数元素都有自己的记录，上述乘除和平方根都逐元素计算。
+
+这也解释了两个代码习惯：**优化器要在循环外创建，`zero_grad()` 只清当前梯度。** 否则我们辛苦积累的历史就被反复丢掉了。
+
+### AdamW 中的 W 解决什么问题
+
+为了限制参数过大，可以加入权重衰减。AdamW 把参数按比例缩小，再进行 Adam 的任务梯度更新：
+
+$$
+\theta_t=(1-\eta\lambda)\theta_{t-1}
+-\eta\frac{\hat m_t}{\sqrt{\hat v_t}+\varepsilon}
+$$
+
+$\lambda$ 是权重衰减系数。在这个规则中，衰减项不进入 Adam 的两份梯度历史。
+
+这与给损失加上 $\lambda\theta^2/2$ 有什么区别？后者求导后会把 $\lambda\theta$ 加进梯度。在普通无动量 SGD 中，两种方式等价；在 Adam 中，这个附加梯度还要进入移动平均和自适应缩放，因此一般不等价。
+
+权重衰减是一种约束手段，不保证每次更新后参数都变小，因为任务梯度可能把参数往相反方向推。优化器的选择也不能替代验证集上的比较。
+
+## 9. 做对练习题之后，还要用新题检查
+
+一个网络可以把训练集拟合得很好，却在新样本上表现不好。这就像学生熟记了练习题答案，换一道题却不会做。
+
+因此，我们在训练前把数据分成三份：
+
+| 数据 | 在本文流程中的用途 |
 | --- | --- |
-| 1 | 1.0113 |
-| 2 | 1.9886 |
-| -1 | -1.0515 |
-| 0 | 0.2006 |
+| 训练集 | 计算梯度，更新参数 |
+| 验证集 | 比较各轮效果，选择要保留的参数 |
+| 测试集 | 选择结束后，报告一次最终表现 |
 
-网络已经较好地拟合这四个训练样本，但还没有完全拟合，尤其第四个样本仍有明显误差。**本实验没有验证集和测试集，不能据此说明泛化能力。**
+假设第 40 轮的验证 Loss 最低，之后训练 Loss 继续下降，验证 Loss 却升高了。这时第 100 轮不一定比第 40 轮更值得保留。
 
-这个实验的价值是把训练的每一环都实际执行了一遍：矩阵参数产生预测，标量 Loss 汇总样本误差，反向传播计算共享参数的梯度，再用这些梯度修改参数。
+想保存第 40 轮，也不能只写 `best_state = model.state_dict()`。这个状态映射中的 Tensor 仍可能共享模型的底层数据，后续训练会继续改变它们。要留下当时的独立快照：
 
-## 手写网络中的三个检查点
+```python
+best_state = copy.deepcopy(model.state_dict())
+```
 
-| 检查点 | 需要确认的内容 |
-| --- | --- |
-| 前向计算 | 矩阵维度兼容，激活函数位置正确，预测与目标 shape 一致 |
-| 反向传播 | Loss 为标量，参数连接到计算图，梯度 shape 与参数一致 |
-| 参数更新 | 使用本轮梯度更新原参数，清除旧梯度，下一轮重新前向计算 |
+训练结束后再恢复它。这里是在全部训练完成后选择最佳轮次，并不是提前停止训练。
 
-Loss 不下降时，可以沿这三个位置逐步检查。尤其要区分“梯度已正确计算”和“参数确实得到更新”，以及“梯度为零”和“误差已经足够小”。
+评价前还要区分两个动作：
 
-下一篇[从训练循环到最佳模型](/docs/from-training-loops-to-best-models)将这些显式操作交给 `nn.Module`、DataLoader 和优化器，并进一步处理训练模式、验证和参数快照。
+```python
+model.eval()
+with torch.no_grad():
+    prediction = model(X)
+```
+
+`eval()` 切换模型行为，`no_grad()` 关闭梯度记录。我们的 Linear + ReLU 网络在训练与评价模式下计算规则相同；加入下一节的 Dropout 后，模式差异就会显现。习惯上仍应把这两个动作写完整，恢复训练前再调用 `model.train()`。
+
+## 10. 两个常见组件：分别在什么问题下引入
+
+目前这道绝对值题不需要继续堆组件。不过阅读更大的网络时，你很快会遇到 Dropout 和 LayerNorm。我们先理解它们解决什么问题，再看计算。
+
+### Dropout：避免过度依赖固定的中间特征
+
+如果后面的层总是依赖某几个特征，训练时随机遮住一部分特征，可以促使网络学习其他可用组合。这就是 Dropout 的出发点，也是缓解过拟合的一种方法。
+
+例如，一个激活值是 3，设置 `p=0.2`。训练时它有 20% 的概率变成 0，80% 的概率变成 `3 / 0.8 = 3.75`。为什么保留时要放大？因为这样平均来看，数值仍是 3：
+
+$$
+0.2\times0+0.8\times3.75=3
+$$
+
+它保持的是每个元素的期望，并不保证每次恰好有 20% 的元素被清零。Dropout 本身没有可训练参数。
+
+评价时，我们希望使用完整网络，所以调用 `eval()` 后，Dropout 原样传递输入，不再随机置零。单独写 `no_grad()` 不会关闭这个随机行为。
+
+Dropout 是否有效，应在相同模型选择规则下比较验证表现。不能因为训练 Loss 更高就说模型变差，也不能看到某一次验证提升就认定它适合所有任务。
+
+### LayerNorm：先调整同一个样本内部的特征尺度
+
+考虑两个样本的隐藏特征：`[1, 2, 3]` 和 `[10, 20, 30]`。它们相对大小相似，整体数值尺度却不同。LayerNorm 会沿指定的特征维度，先减去均值，再除以标准差。
+
+对第一个样本，均值为 2，方差为 `((1-2)² + (2-2)² + (3-2)²) / 3 = 2/3`。忽略很小的稳定项，标准化后约为 `[-1.2247, 0, 1.2247]`。第二个样本也得到近似相同的结果。
+
+对 `[B, D]` 输入使用 `nn.LayerNorm(D)`，每一行独立计算：
+
+$$
+\mu=\frac1D\sum_{j=1}^{D}x_j,\qquad
+\sigma^2=\frac1D\sum_{j=1}^{D}(x_j-\mu)^2
+$$
+
+$$
+\tilde x_j=\frac{x_j-\mu}{\sqrt{\sigma^2+\varepsilon}},\qquad
+z_j=\gamma_j\tilde x_j+\beta_j
+$$
+
+$j$ 表示该样本的第几个特征。最后的 $\gamma_j$ 和 $\beta_j$ 是可训练的缩放、平移参数，让模型自己调整标准化后的表示。默认分别从 1 和 0 开始。
+
+要分清：均值和方差来自当前样本，gamma 和 beta 来自训练，并在不同样本间共享。`nn.LayerNorm(3)` 默认有六个参数元素，不随 batch 大小变化；训练与评价时都使用当前输入的统计量。
+
+标准化也不保证最终输出方差永远为 1：全相等的输入标准化后是零，稳定项和后续缩放也会影响结果。它是否适合某一层，要结合任务和结构判断，不能把“标准化”理解为自动变得更好。
+
+## 11. 完整实验：让网络自己学出绝对值
+
+现在把前面学过的步骤接起来。仍然使用 `1 → 16 → 1` 的网络，让它从随机初始化出发，拟合区间 `[-2, 2]` 上的绝对值函数。
+
+这次使用 Adam 来演示优化器封装，不加入 Dropout、LayerNorm 或权重衰减。它们各有用途，但不是这个小实验成立的前提。损失统一使用半平方误差，与前面的手算一致。
+
+下面代码只依赖 PyTorch，包含数据生成、训练、验证、保存、恢复和测试。保存文件用于推理，不包含继续训练所需的优化器状态。
+
+```python
+import copy
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+
+torch.manual_seed(42)
+
+# 同一个分布中独立采样，先划分，再开始训练。
+X = torch.rand(480, 1) * 4 - 2
+y = X.abs()
+train_data = TensorDataset(X[:320], y[:320])
+val_data = TensorDataset(X[320:400], y[320:400])
+test_data = TensorDataset(X[400:], y[400:])
+
+train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_data, batch_size=32)
+test_loader = DataLoader(test_data, batch_size=32)
+
+
+def make_model():
+    return nn.Sequential(
+        nn.Linear(1, 16),
+        nn.ReLU(),
+        nn.Linear(16, 1),
+    )
+
+
+def loss_function(prediction, target):
+    assert prediction.shape == target.shape
+    return (0.5 * (prediction - target) ** 2).mean()
+
+
+def evaluate(model, loader):
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+    with torch.no_grad():
+        for inputs, targets in loader:
+            prediction = model(inputs)
+            batch_loss = loss_function(prediction, targets)
+            count = inputs.shape[0]
+            total_loss += batch_loss.item() * count
+            total_samples += count
+    return total_loss / total_samples
+
+
+model = make_model()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+best_val_loss = float("inf")
+best_epoch = 0
+best_state = None
+
+for epoch in range(1, 201):
+    model.train()
+    for inputs, targets in train_loader:
+        optimizer.zero_grad()
+        prediction = model(inputs)
+        loss = loss_function(prediction, targets)
+        loss.backward()
+        optimizer.step()
+
+    # 两个指标都使用本轮结束后的同一组参数重新计算。
+    train_loss = evaluate(model, train_loader)
+    val_loss = evaluate(model, val_loader)
+
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_epoch = epoch
+        best_state = copy.deepcopy(model.state_dict())
+
+    if epoch == 1 or epoch % 50 == 0:
+        print(f"epoch={epoch:3d} train={train_loss:.6f} val={val_loss:.6f}")
+
+assert best_state is not None
+checkpoint_path = "absolute_value_best.pt"
+torch.save(best_state, checkpoint_path)
+
+# 新建同样结构的模型，验证磁盘中的参数确实可以恢复。
+restored = make_model()
+restored.load_state_dict(
+    torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+)
+restored_val_loss = evaluate(restored, val_loader)
+assert abs(restored_val_loss - best_val_loss) < 1e-6
+
+# 模型选择结束后，才评价测试集。
+test_loss = evaluate(restored, test_loader)
+print(f"best_epoch={best_epoch} best_val={best_val_loss:.6f}")
+print(f"test={test_loss:.6f}")
+
+restored.eval()
+with torch.no_grad():
+    examples = torch.tensor([[-1.5], [-0.5], [0.0], [0.5], [1.5]])
+    predictions = restored(examples)
+    for value, prediction in zip(examples[:, 0], predictions[:, 0]):
+        print(f"x={value.item():+.1f}, prediction={prediction.item():.4f}")
+```
+
+运行时先看训练和验证误差是否整体下降，再看最后几组输入的预测是否接近 `1.5、0.5、0、0.5、1.5`。固定随机种子便于比较，但不同运行环境不承诺逐位相同的结果。
+
+注意，我们没有把开头的精确权重交给网络。16 个隐藏单元学出的参数也未必长得像手工构造的两个单元。不同参数组合可以表达相似的函数，训练追求的是预测表现，而不是还原唯一一份“标准参数”。
+
+这个实验的测试数据仍来自 `[-2, 2]`。即使区间内误差很小，也不能据此推断模型在 100 或 -100 处仍会正确。它展示的是指定数据分布下的学习与评价流程。
+
+## 12. 再回到最初的五行代码
+
+现在可以把训练过程读成一段完整的话：清掉旧梯度，让当前网络做预测，用损失函数衡量误差，沿计算图把误差对参数的影响算出来，再由优化器修改参数。
+
+网络结构决定它能表达什么，梯度和优化器决定参数怎样变化，验证集决定哪一轮值得保留。最终保存的是选中时刻的参数快照；实际使用时，还需要相同的模型结构和正确的评价模式。
+
+如果训练表现不符合预期，可以按这条顺序排查：先核对输入与目标，再检查预测和 Loss 的 shape，然后确认梯度存在、参数确实更新，最后比较训练与验证表现。这样每一步都有明确的问题可以回答。
+
+下一篇[从 Token 到文本生成](/docs/from-tokens-to-transformer-generation)会把输入从数值扩展到文本。模型的前向结构会复杂起来，但这里建立的“预测 → Loss → 梯度 → 更新 → 验证选择”仍然适用。

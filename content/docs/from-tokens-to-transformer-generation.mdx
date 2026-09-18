@@ -2,7 +2,7 @@
 title: "从 Token 到文本生成：理解 Transformer 的计算与训练"
 date: "2026-09-17"
 tag: "AI"
-order: "4"
+order: "3"
 description: "从 Embedding 和序列状态出发，串起 Q/K/V、多头注意力、位置编码、掩码与 Transformer Block，并通过交叉熵维度检查和循环序列实验，理解 next-token 训练与自回归生成。"
 ---
 
@@ -12,7 +12,7 @@ description: "从 Embedding 和序列状态出发，串起 Q/K/V、多头注意�
 
 下面从 Embedding 和序列状态讲起，逐步展开 Attention、多头计算、位置编码与掩码，再组装一个简化 Transformer。每个关键运算都配有 shape 和具体例子，最后用循环数字序列验证训练与生成流程。
 
-训练基础可以参考[从 Loss 到泛化](/docs/from-loss-to-generalization)、[从线性层到神经网络](/docs/from-linear-layers-to-neural-networks)和[从训练循环到最佳模型](/docs/from-training-loops-to-best-models)。
+训练基础可以参考[从 Loss 到泛化](/docs/from-loss-to-generalization)和[从线性模型到神经网络](/docs/from-linear-layers-to-neural-networks)。后者从线性模型的局限讲起，完整介绍网络结构、反向传播、批量训练，以及如何验证和保存最佳模型。
 
 ## 符号与维度约定
 
