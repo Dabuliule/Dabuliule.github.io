@@ -6,6 +6,7 @@
     "from-linear-layers-to-neural-networks",
     "from-tokens-to-transformer-generation",
     "from-character-prediction-to-tiny-gpt",
+    "from-next-token-to-modern-llm",
     "---Agent Runtime---",
     "agent-runtime-planner",
     "eventbus_in_agent_runtime",
